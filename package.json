@@ -6,6 +6,10 @@
   "description": "JupyterLab/Jupyter Server connector: run code in persistent remote kernels from DeepSeek Harness",
   "license": "MIT",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node scripts/test-all.mjs",
+    "test:offline": "node test/transport.mjs && node test/notebook.mjs && node test/activity.mjs && node test/client.mjs"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
