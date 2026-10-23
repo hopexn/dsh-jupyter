@@ -256,7 +256,7 @@ await check('it registers both dictionaries with every key the UI asks for', () 
   assert.equal(page.registered.locales[0].ns, 'jupyterlab')
   assert.deepEqual(Object.keys(page.registered.locales[0].dicts).sort(), ['en', 'zh'])
   const english = page.registered.locales[0].dicts.en
-  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder']) {
+  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell']) {
     assert.equal(typeof english[key], 'string', `missing translation "${key}"`)
   }
 })
@@ -597,6 +597,70 @@ await check('a clear event wipes the cell before the next chunk', async () => {
   }
 })
 
+await check('an insert event adds the agent\'s cell to the list', async () => {
+  const sources = installEventSource()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({ status: 200, json: async () => viewOf([cellOf()]) })
+  try {
+    const fresh = loadBundle()
+    const Notebook = fresh.component('sidebar.right.pane.tab')
+    fresh.React.reset()
+    fresh.slots.length = 0
+    fresh.slots[0] = viewOf([cellOf()])
+    Notebook({ sessionId: 's-insert', t: (key) => key })
+    const stream = sources.instances[0]
+    stream.emit({
+      type: 'insert',
+      revision: 4,
+      index: 1,
+      cell: cellOf({ id: 'c2', origin: 'agent', source: 'print(2)', rev: 1 }),
+    })
+    fresh.React.reset()
+    const tree = Notebook({ sessionId: 's-insert', t: (key) => key })
+    const order = flatten(tree)
+      .filter((node) => typeof node.type === 'function' && node.props?.cell !== undefined)
+      .map((node) => node.props.cell.id)
+    assert.deepEqual(order, ['c1', 'c2'], 'an insert must grow the list, not be dropped like an unknown event')
+  } finally {
+    globalThis.fetch = original
+    sources.restore()
+  }
+})
+
+await check('a full view older than a streamed event does not move the notebook backwards', async () => {
+  const sources = installEventSource()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({
+    status: 200,
+    json: async () => viewOf([cellOf({ status: 'running', rev: 2 })], { revision: 4 }),
+  })
+  try {
+    const fresh = loadBundle()
+    const Notebook = fresh.component('sidebar.right.pane.tab')
+    fresh.React.reset()
+    fresh.slots.length = 0
+    fresh.slots[0] = viewOf([cellOf()])
+    Notebook({ sessionId: 's-stale', t: (key) => key })
+    const stream = sources.instances[0]
+    stream.emit({
+      type: 'cell',
+      revision: 6,
+      cell: cellOf({ status: 'ok', rev: 3, outputs: [{ type: 'text', text: 'done' }] }),
+    })
+    // A slow fetch, started before the event, answers with revision 4.
+    stream.open()
+    await tick()
+    fresh.React.reset()
+    const tree = Notebook({ sessionId: 's-stale', t: (key) => key })
+    const cell = findComponent(tree, (props) => props.cell?.id === 'c1').props.cell
+    assert.equal(cell.rev, 3, 'the older snapshot must be ignored')
+    assert.equal(cell.status, 'ok')
+  } finally {
+    globalThis.fetch = original
+    sources.restore()
+  }
+})
+
 await check('a poll that changed nothing keeps the cell objects, so memo can skip them', async () => {
   const original = globalThis.fetch
   const payload = JSON.stringify(viewOf([cellOf()]))
@@ -641,6 +705,36 @@ await check('the badge disappears when nothing is queued', () => {
   page.slots[0] = viewOf([cellOf()], { pendingNotes: 0 })
   const tree = Notebook({ sessionId: 's-badge', t: (key) => key })
   assert.equal(flatten(tree).find((node) => node.props?.className === 'dshj-sync'), undefined)
+})
+
+await check('the badge opens the list of what will be sent, not just a number', () => {
+  const Notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cellOf()], {
+    pendingNotes: 2,
+    notes: [{ key: 'a', summary: 'Edited cell 1 (code)' }, { key: 'b', summary: 'Ran cell 2 (code)' }],
+  })
+  const tree = Notebook({ sessionId: 's-notes', t: (key) => key })
+  const badge = flatten(tree).find((node) => node.props?.className === 'dshj-sync')
+  assert.equal(badge.type, 'button', 'the badge must be openable')
+  assert.equal(badge.props['aria-expanded'], 'false')
+  badge.props.onClick()
+  page.React.reset()
+  const opened = Notebook({ sessionId: 's-notes', t: (key) => key })
+  const panel = flatten(opened).find((node) => node.props?.className === 'dshj-notes')
+  assert.ok(panel !== undefined, 'clicking the badge must reveal the queued notes')
+  assert.match(textOf(panel), /Edited cell 1 \(code\)/)
+  assert.match(textOf(panel), /Ran cell 2 \(code\)/)
+})
+
+await check('an agent-created cell is marked, a user cell is not', () => {
+  const agentCell = renderCell(page, cellOf({ origin: 'agent' }))
+  const chip = flatten(agentCell).find((node) => node.props?.className === 'dshj-origin')
+  assert.ok(chip !== undefined, 'an agent cell must say so')
+  assert.equal(textOf(chip), 'agent')
+  const userCell = renderCell(page, cellOf())
+  assert.equal(flatten(userCell).find((node) => node.props?.className === 'dshj-origin'), undefined)
 })
 
 console.log('\nhighlighting')

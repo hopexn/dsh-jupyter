@@ -254,6 +254,19 @@ await check('an empty batch produces no message', async () => {
   assert.equal(messageForNotes([]), undefined)
 })
 
+await check('queued notes can be listed without consuming them', async () => {
+  const activity = new NotebookActivity()
+  activity.record('session-a', edit)
+  activity.record('session-a', { type: 'clear', index: 2, id: 'cell-c', kind: 'code' })
+  const list = activity.list('session-a')
+  assert.equal(list.length, 2)
+  assert.equal(list[0].summary, 'Edited cell 2 (code)')
+  assert.equal(typeof list[0].key, 'string')
+  assert.equal(activity.pending('session-a'), 2, 'listing must not drain')
+  assert.equal(activity.drain('session-a').length, 2)
+  assert.deepEqual(activity.list('session-a'), [])
+})
+
 console.log('\npre-step delivery')
 
 /** A plugin context that only records the listeners it is given. */
@@ -355,6 +368,50 @@ await check('a decision without a messages array still gets the note', async () 
   const result = await step(handlerFor('agent/pre-step'), { decision: { kind: 'enter' } })
   assert.equal(result.messages.length, 1)
   assert.equal(result.messages[0].source.plugin, 'jupyterlab')
+})
+
+await check('the first note carries a map of the notebook, and later ones do not', async () => {
+  const activity = new NotebookActivity()
+  const { ctx, handlerFor } = captureContext()
+  let revision = 7
+  let maps = 0
+  registerContextInjection(ctx, {
+    activity,
+    notebooks: {
+      revision: () => revision,
+      outline: () => { maps += 1; return 'The notebook holds:\n1. [code] x = 1' },
+    },
+  })
+  const handler = handlerFor('agent/pre-step')
+
+  activity.record('session-a', edit)
+  const first = await step(handler)
+  assert.match(first.messages.at(-1).content[0].text, /The notebook holds/)
+  assert.match(first.messages.at(-1).content[0].text, /1\. \[code\] x = 1/)
+
+  activity.record('session-a', edit)
+  const second = await step(handler)
+  assert.doesNotMatch(second.messages.at(-1).content[0].text, /The notebook holds/)
+  assert.equal(maps, 1, 'the map is sent once, not on every batch')
+
+  // A reset starts a new notebook at a lower revision; the model has never seen that one either.
+  revision = 0
+  activity.record('session-a', edit)
+  const third = await step(handler)
+  assert.match(third.messages.at(-1).content[0].text, /The notebook holds/)
+  assert.equal(maps, 2)
+})
+
+await check('a broken outline still delivers the notes', async () => {
+  const activity = new NotebookActivity()
+  const { ctx, handlerFor } = captureContext()
+  registerContextInjection(ctx, {
+    activity,
+    notebooks: { revision: () => 1, outline: () => { throw new Error('no notebook') } },
+  })
+  activity.record('session-a', edit)
+  const result = await step(handlerFor('agent/pre-step'))
+  assert.match(result.messages.at(-1).content[0].text, /edited cell 2/)
 })
 
 await check('a failing buffer never breaks the step', async () => {
