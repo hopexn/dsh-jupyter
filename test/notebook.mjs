@@ -13,8 +13,9 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { Notebooks, renderableOutputs } from '../lib/notebook.js'
-import { NOTEBOOK_ROUTE, registerNotebookRoutes } from '../lib/routes.js'
+import { Notebooks, OutputRenderer, renderableOutputs } from '../lib/notebook.js'
+import { ASSET_ROUTE, NOTEBOOK_ROUTE, STREAM_ROUTE, registerNotebookRoutes } from '../lib/routes.js'
+import { AssetStore } from '../lib/assets.js'
 
 let passed = 0
 const failures = []
@@ -39,7 +40,7 @@ function fakeRuntime() {
   const calls = []
   let kernel = { id: 'kernel-1', name: 'python3', state: 'idle' }
   let next = 1
-  const reply = (code) => {
+  const reply = (code, options = {}) => {
     if (code.includes('raise')) {
       return {
         status: 'error',
@@ -59,6 +60,17 @@ function fakeRuntime() {
     if (code.includes('slow')) {
       return { status: 'timeout', message: 'no result within 2000ms; the kernel was interrupted', executionCount: null, durationMs: 2000, outputs: [{ kind: 'stream', name: 'stdout', text: 'partial\n' }] }
     }
+    if (code.includes('streamy')) {
+      // Two chunks in the same channel: the panel must see them grow, not appear all at once.
+      options.onOutput?.({ kind: 'stream', name: 'stdout', text: 'first\n' })
+      options.onOutput?.({ kind: 'stream', name: 'stdout', text: 'second\n' })
+      return {
+        status: 'ok',
+        executionCount: next++,
+        durationMs: 30,
+        outputs: [{ kind: 'stream', name: 'stdout', text: 'first\nsecond\n' }],
+      }
+    }
     return {
       status: 'ok',
       executionCount: next++,
@@ -73,7 +85,7 @@ function fakeRuntime() {
   return {
     calls,
     runtime: {
-      execute: async (_sessionId, code) => { calls.push(code); return reply(code) },
+      execute: async (_sessionId, code, options) => { calls.push(code); return reply(code, options) },
       kernelInfo: async () => kernel,
     },
     setKernel: (value) => { kernel = value },
@@ -132,7 +144,9 @@ await check('deleteCell removes it, and never leaves the notebook empty', async 
 await check('runCell sends the code to the kernel and stores its outputs', async () => {
   const cell = (await notebooks.view(SESSION)).cells[0]
   await notebooks.command(SESSION, { action: 'updateCell', id: cell.id, source: 'print(1)' })
-  const view = await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.idle(SESSION)
+  const view = await notebooks.view(SESSION)
   const ran = view.cells[0]
   assert.equal(ran.status, 'ok')
   assert.equal(ran.executionCount, 1)
@@ -148,7 +162,9 @@ await check('runCell sends the code to the kernel and stores its outputs', async
 await check('a cell traceback becomes a renderable error output', async () => {
   const cell = (await notebooks.view(SESSION)).cells[0]
   await notebooks.command(SESSION, { action: 'updateCell', id: cell.id, source: 'raise ValueError("boom")' })
-  const view = await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.idle(SESSION)
+  const view = await notebooks.view(SESSION)
   assert.equal(view.cells[0].status, 'error')
   assert.equal(view.cells[0].outputs[0].type, 'error')
   assert.match(view.cells[0].outputs[0].text, /ValueError: boom/)
@@ -157,7 +173,9 @@ await check('a cell traceback becomes a renderable error output', async () => {
 await check('an image result is delivered as a data URL beside its text', async () => {
   const cell = (await notebooks.view(SESSION)).cells[0]
   await notebooks.command(SESSION, { action: 'updateCell', id: cell.id, source: 'show image' })
-  const view = await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.idle(SESSION)
+  const view = await notebooks.view(SESSION)
   const types = view.cells[0].outputs.map((output) => output.type)
   assert.deepEqual(types, ['text', 'image'])
   assert.equal(view.cells[0].outputs[1].dataUrl, 'data:image/png;base64,aGVsbG8=')
@@ -166,7 +184,9 @@ await check('an image result is delivered as a data URL beside its text', async 
 await check('a timeout keeps the partial output and explains itself', async () => {
   const cell = (await notebooks.view(SESSION)).cells[0]
   await notebooks.command(SESSION, { action: 'updateCell', id: cell.id, source: 'slow cell' })
-  const view = await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.idle(SESSION)
+  const view = await notebooks.view(SESSION)
   assert.equal(view.cells[0].status, 'timeout')
   const texts = view.cells[0].outputs.map((output) => output.text)
   assert.ok(texts.includes('partial\n'), JSON.stringify(view.cells[0].outputs))
@@ -180,10 +200,90 @@ await check('an execution failure is reported on the cell instead of thrown', as
     kernelInfo: async () => undefined,
   })
   const cell = (await failing.view(SESSION)).cells[0]
-  const view = await failing.command(SESSION, { action: 'runCell', id: cell.id })
+  await failing.command(SESSION, { action: 'runCell', id: cell.id })
+  await failing.idle(SESSION)
+  const view = await failing.view(SESSION)
   assert.equal(view.cells[0].status, 'error')
   assert.equal(view.cells[0].error, 'cannot reach the kernel')
   failing.dispose()
+})
+
+await check('runCell answers before the kernel is done, and the run outlives the request', async () => {
+  let release
+  const pending = new Notebooks({
+    directory,
+    execute: () => new Promise((resolve) => { release = resolve }),
+    kernelInfo: async () => undefined,
+  })
+  const cell = (await pending.view('session-async')).cells[0]
+  // The old shape awaited the execution here, which is exactly why a 60-second cell left the panel
+  // blank for 60 seconds and why a page reload (an aborted POST) killed it.
+  const view = await pending.command('session-async', { action: 'runCell', id: cell.id, source: 'sleep(60)' })
+  assert.equal(view.cells[0].status, 'running', 'the command must not wait for the execution')
+  assert.equal(pending.isRunning('session-async'), true)
+  release({ status: 'ok', executionCount: 7, durationMs: 60_000, outputs: [{ kind: 'stream', name: 'stdout', text: 'done\n' }] })
+  await pending.idle('session-async')
+  const after = await pending.view('session-async')
+  assert.equal(after.cells[0].status, 'ok')
+  assert.equal(after.cells[0].executionCount, 7)
+  assert.deepEqual(after.cells[0].outputs, [{ type: 'stream', name: 'stdout', text: 'done\n' }])
+  pending.dispose()
+})
+
+await check('output streams to subscribers as it is produced, ending with the whole cell', async () => {
+  const events = []
+  const off = notebooks.subscribe(SESSION, (event) => events.push(event))
+  const cell = (await notebooks.view(SESSION)).cells[0]
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id, source: 'streamy' })
+  await notebooks.idle(SESSION)
+  off()
+  const kinds = events.map((event) => event.type)
+  assert.equal(kinds[0], 'cell', 'the start of a run is announced first')
+  const texts = events.filter((event) => event.type === 'text')
+  assert.deepEqual(texts.map((event) => event.text), ['first\n', 'second\n'])
+  assert.deepEqual(texts.map((event) => event.index), [0, 0], 'both chunks belong to one output')
+  const last = events[events.length - 1]
+  assert.equal(last.type, 'cell')
+  assert.equal(last.cell.status, 'ok')
+  assert.deepEqual(last.cell.outputs, [{ type: 'stream', name: 'stdout', text: 'first\nsecond\n' }])
+})
+
+await check('unsubscribing stops the events', async () => {
+  const seen = []
+  notebooks.subscribe(SESSION, (event) => seen.push(event))()
+  const cell = (await notebooks.view(SESSION)).cells[0]
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id, source: 'print(2)' })
+  await notebooks.idle(SESSION)
+  assert.deepEqual(seen, [])
+})
+
+await check('an image is stored once by content and referenced by URL', async () => {
+  const assets = new AssetStore({ directory: path.join(directory, 'assets'), maxCachedBytes: 4 })
+  const stored = new Notebooks({
+    directory,
+    execute: fake.runtime.execute,
+    asset: (mime, base64) => assets.put(mime, base64),
+  })
+  const first = async () => {
+    const cell = (await stored.view('session-image')).cells[0]
+    await stored.command('session-image', { action: 'runCell', id: cell.id, source: 'show image' })
+    await stored.idle('session-image')
+    return (await stored.view('session-image')).cells[0]
+  }
+  const cell = await first()
+  const image = cell.outputs.find((output) => output.type === 'image')
+  assert.ok(image !== undefined, JSON.stringify(cell.outputs))
+  assert.equal(image.dataUrl, undefined, 'the bytes must not travel inside the notebook document')
+  assert.match(image.url, /^api\/jupyterlab\/asset\?name=[0-9a-f]{20}\.png$/)
+  const name = image.url.split('name=')[1]
+  assert.equal(assets.get(name)?.data.toString(), 'hello')
+  // Running it again stores nothing new: the name is the hash of the bytes.
+  await first()
+  assert.equal(assets.size, 1)
+  // The store refuses anything that is not one of its own names.
+  assert.equal(assets.get('../../etc/passwd'), undefined)
+  assert.equal(assets.get('nope.png'), undefined)
+  stored.dispose()
 })
 
 await check('clearOutput and clearAllOutputs empty the outputs', async () => {
@@ -262,9 +362,8 @@ await check('the route registers when Connection arrives later, not only at moun
   assert.deepEqual(seen, [], 'a pending registration reports nothing yet')
 
   deliver(childContext({ fetch: { register: (route) => { routes.push(route); return () => {} } } }))
-  assert.equal(routes.length, 1, 'the route must appear once the service arrives')
-  assert.equal(routes[0].path, NOTEBOOK_ROUTE)
-  assert.deepEqual([...routes[0].methods].sort(), ['GET', 'POST'])
+  assert.equal(routes.length, 3, 'the notebook route, its output stream, and the asset route')
+  assert.deepEqual(routes.map((entry) => entry.path).sort(), [ASSET_ROUTE, NOTEBOOK_ROUTE, STREAM_ROUTE].sort())
   assert.deepEqual(seen, ['registered'])
 })
 await check('a headless profile reports the panel as unavailable instead of throwing', () => {
@@ -280,17 +379,26 @@ await check('a headless profile reports the panel as unavailable instead of thro
 })
 
 // The main context, with the service already present.
+const assets = new AssetStore({ directory: path.join(directory, 'assets-route') })
 registerNotebookRoutes(
   { inject: (deps, callback) => { callback(childContext(fakeConnection)) } },
-  { notebooks, connectionInfo: () => ({ configured: true, url: 'http://example.test' }), onState: (state) => states.push(state) },
+  {
+    notebooks,
+    assets,
+    connectionInfo: () => ({ configured: true, url: 'http://example.test' }),
+    onState: (state) => states.push(state),
+  },
 )
-const route = registered[0]
+const route = registered.find((entry) => entry.path === NOTEBOOK_ROUTE)
+const streamRoute = registered.find((entry) => entry.path === STREAM_ROUTE)
+const assetRoute = registered.find((entry) => entry.path === ASSET_ROUTE)
 
 await check('the registered route carries the panel protocol', () => {
-  assert.equal(registered.length, 1)
-  assert.equal(route.path, NOTEBOOK_ROUTE)
+  assert.equal(registered.length, 3)
   assert.deepEqual([...route.methods].sort(), ['GET', 'POST'])
   assert.equal(route.requestBody, 'buffered')
+  assert.deepEqual([...streamRoute.methods], ['GET'])
+  assert.deepEqual([...assetRoute.methods], ['GET'])
   assert.deepEqual(states, ['registered'])
 })
 
@@ -328,6 +436,54 @@ await check('POST with a bad command reports the error without a 500', async () 
 await check('POST with a malformed body reports it', async () => {
   const response = await route.fetch(new Request(`http://127.0.0.1:19387${NOTEBOOK_ROUTE}`, { method: 'POST', body: 'not json' }))
   assert.equal(response.status, 400)
+})
+
+await check('the asset route serves the bytes with an immutable cache header', async () => {
+  const stored = assets.put('image/png', Buffer.from('hello').toString('base64'))
+  assert.ok(stored !== undefined)
+  const response = await assetRoute.fetch(new Request(`http://127.0.0.1:19387${ASSET_ROUTE}?name=${stored.name}`, { method: 'GET' }))
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('content-type'), 'image/png')
+  assert.match(response.headers.get('cache-control'), /immutable/)
+  assert.equal(await response.text(), 'hello')
+})
+await check('the asset route answers 404 for a name it never issued', async () => {
+  const response = await assetRoute.fetch(new Request(`http://127.0.0.1:19387${ASSET_ROUTE}?name=../../etc/passwd`, { method: 'GET' }))
+  assert.equal(response.status, 404)
+})
+
+await check('the stream route pushes a running cell\'s output as it arrives', async () => {
+  const response = await streamRoute.fetch(new Request(`http://127.0.0.1:19387${STREAM_ROUTE}?sessionId=${SESSION}`, { method: 'GET' }))
+  assert.equal(response.status, 200)
+  assert.match(response.headers.get('content-type'), /text\/event-stream/)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  /** Read whatever arrives within `ms`, so the test never depends on exact scheduling. */
+  const drain = async (ms) => {
+    const deadline = Date.now() + ms
+    for (;;) {
+      const left = deadline - Date.now()
+      if (left <= 0) return
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve(undefined), left)),
+      ])
+      if (result === undefined || result.done === true) return
+      text += decoder.decode(result.value, { stream: true })
+    }
+  }
+  await drain(50)
+  const cell = (await notebooks.view(SESSION)).cells[0]
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id, source: 'streamy' })
+  await notebooks.idle(SESSION)
+  // The deltas are coalesced for 60 ms before they are written; the final cell is sent at once.
+  await drain(400)
+  await reader.cancel()
+  assert.match(text, /: connected/, 'the stream must open immediately')
+  assert.match(text, /"type":"cell"/, 'the run start and end are announced')
+  assert.match(text, /"type":"text"/, 'streamed chunks arrive as deltas')
+  assert.match(text, /first\\nsecond\\n/, 'the final cell carries the coalesced stream')
 })
 
 notebooks.dispose()

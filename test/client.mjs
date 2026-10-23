@@ -99,6 +99,9 @@ function makeReact(slots) {
     },
     useRef: (initial) => ({ current: initial ?? null }),
     useEffect: (fn) => { effects.push(fn()) },
+    // The real component tree bails out of re-rendering on equal props; here the memo wrapper is
+    // transparent, so the render paths stay directly callable from the tests.
+    memo: (component) => component,
     useState(initial) {
       const slot = index
       index += 1
@@ -165,6 +168,7 @@ function cellOf(overrides = {}) {
     id: 'c1',
     kind: 'code',
     source: 'print(1)',
+    rev: 1,
     status: 'idle',
     executionCount: 2,
     durationMs: 1,
@@ -172,6 +176,34 @@ function cellOf(overrides = {}) {
     error: null,
     ...overrides,
   }
+}
+
+/** Let queued promises settle, so an effect's async work lands in the harness slots. */
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+/** A stand-in for the page's `EventSource`, recording every stream the panel opens. */
+function installEventSource() {
+  const instances = []
+  class FakeEventSource {
+    constructor(url) {
+      this.url = String(url)
+      this.closed = false
+      this.onopen = null
+      this.onmessage = null
+      this.onerror = null
+      instances.push(this)
+    }
+
+    close() { this.closed = true }
+
+    /** Deliver one server frame. */
+    emit(payload) { this.onmessage?.({ data: JSON.stringify(payload) }) }
+
+    /** Pretend the connection came up. */
+    open() { this.onopen?.({}) }
+  }
+  globalThis.EventSource = FakeEventSource
+  return { instances, restore: () => { delete globalThis.EventSource } }
 }
 
 /**
@@ -481,6 +513,101 @@ await check('a command posts to the same document-relative route', async () => {
     assert.equal(posts.length, 1, `expected one POST, got ${JSON.stringify(calls)}`)
     assert.equal(posts[0].url, 'api/jupyterlab/notebook')
     assert.deepEqual(JSON.parse(posts[0].body), { action: 'addCell', sessionId: 's1' })
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+console.log('\nstreaming')
+
+await check('an image output renders from its stored URL', () => {
+  const rendered = renderCell(page, cellOf({
+    outputs: [{ type: 'image', mime: 'image/png', url: 'api/jupyterlab/asset?name=abc.png' }],
+  }))
+  const images = renderOutputs(rendered).filter((node) => node.type === 'img')
+  assert.equal(images.length, 1)
+  assert.equal(images[0].props.src, 'api/jupyterlab/asset?name=abc.png')
+  assert.equal(images[0].props.loading, 'lazy', 'a long notebook must not fetch every plot at once')
+})
+
+await check('the panel opens one stream per session and renders what it pushes', async () => {
+  const sources = installEventSource()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({ status: 200, json: async () => viewOf([cellOf()]) })
+  try {
+    const fresh = loadBundle()
+    const Notebook = fresh.component('sidebar.right.pane.tab')
+    fresh.React.reset()
+    fresh.slots.length = 0
+    fresh.slots[0] = viewOf([cellOf()])
+    Notebook({ sessionId: 's1', t: (key) => key })
+    const opened = sources.instances.filter((source) => !source.closed)
+    assert.equal(opened.length, 1, `expected one stream, got ${sources.instances.length}`)
+    // Document-relative, like every other call the panel makes.
+    assert.equal(opened[0].url, 'api/jupyterlab/notebook/stream?sessionId=s1')
+
+    const stream = opened[0]
+    stream.open()
+    await tick()
+    stream.emit({ type: 'cell', revision: 4, cell: cellOf({ status: 'running', rev: 2, outputs: [] }) })
+    stream.emit({ type: 'append', cellId: 'c1', output: { type: 'stream', name: 'stdout', text: 'hello' } })
+    stream.emit({ type: 'text', cellId: 'c1', index: 0, text: ' world' })
+    fresh.React.reset()
+    const tree = Notebook({ sessionId: 's1', t: (key) => key })
+    const node = findComponent(tree, (props) => props.cell?.id === 'c1')
+    assert.equal(node.props.cell.status, 'running', 'the run is visible before the command answers')
+    const text = JSON.stringify(renderOutputs(node.type(node.props)).map((child) => child.props?.children))
+    assert.match(text, /hello world/, `streamed text must grow in one entry, got ${text}`)
+  } finally {
+    globalThis.fetch = original
+    sources.restore()
+  }
+})
+
+await check('a clear event wipes the cell before the next chunk', async () => {
+  const sources = installEventSource()
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({ status: 200, json: async () => viewOf([cellOf()]) })
+  try {
+    const fresh = loadBundle()
+    const Notebook = fresh.component('sidebar.right.pane.tab')
+    fresh.React.reset()
+    fresh.slots.length = 0
+    fresh.slots[0] = viewOf([cellOf({ outputs: [{ type: 'stream', name: 'stdout', text: 'old' }] })])
+    Notebook({ sessionId: 's1', t: (key) => key })
+    const stream = sources.instances[0]
+    stream.emit({ type: 'clear', cellId: 'c1' })
+    stream.emit({ type: 'append', cellId: 'c1', output: { type: 'stream', name: 'stdout', text: 'new' } })
+    fresh.React.reset()
+    const tree = Notebook({ sessionId: 's1', t: (key) => key })
+    const node = findComponent(tree, (props) => props.cell?.id === 'c1')
+    assert.deepEqual(node.props.cell.outputs, [{ type: 'stream', name: 'stdout', text: 'new' }])
+  } finally {
+    globalThis.fetch = original
+    sources.restore()
+  }
+})
+
+await check('a poll that changed nothing keeps the cell objects, so memo can skip them', async () => {
+  const original = globalThis.fetch
+  const payload = JSON.stringify(viewOf([cellOf()]))
+  // Parsed per response on purpose: a fresh document must not defeat the identity check.
+  globalThis.fetch = async () => ({ status: 200, json: async () => JSON.parse(payload) })
+  try {
+    const fresh = loadBundle()
+    const Notebook = fresh.component('sidebar.right.pane.tab')
+    fresh.React.reset()
+    fresh.slots.length = 0
+    Notebook({ sessionId: 's1', t: (key) => key })
+    await tick()
+    fresh.React.reset()
+    const first = Notebook({ sessionId: 's1', t: (key) => key })
+    const before = findComponent(first, (props) => props.cell?.id === 'c1').props.cell
+    await tick()
+    fresh.React.reset()
+    const second = Notebook({ sessionId: 's1', t: (key) => key })
+    const after = findComponent(second, (props) => props.cell?.id === 'c1').props.cell
+    assert.equal(after, before, 'an unchanged cell must keep its identity across a poll')
   } finally {
     globalThis.fetch = original
   }
