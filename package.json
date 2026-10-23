@@ -1,0 +1,39 @@
+{
+  "name": "@local/dsh-jupyterlab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "JupyterLab/Jupyter Server connector: run code in persistent remote kernels from DeepSeek Harness",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "meta": {
+    "title": "JupyterLab",
+    "description": "Connect to a Jupyter server, run code in persistent remote kernels, and edit a notebook in the right sidebar."
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

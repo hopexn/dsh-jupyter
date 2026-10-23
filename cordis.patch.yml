@@ -1,0 +1,21 @@
+# Bundle patch for @local/dsh-jupyterlab.
+#
+# `insert` adds the plugin row to whatever profile selects this bundle. The row id is the
+# settings namespace and must stay unique across the profile.
+#
+# Configure the plugin either here (a `config:` mapping on this row, which the profile's own
+# cordis.patch.yml can override) or at runtime by asking the agent to call jupyter_connect with
+# the JupyterLab address. Example of a pre-filled config:
+#
+#   - insert:
+#       - id: jupyterlab
+#         name: '@local/dsh-jupyterlab'
+#         config:
+#           url: http://aimax395.local:9002/lab
+#           token: <your token>
+#           kernelName: python3
+#
+- insert:
+    - id: jupyterlab
+      name: '@local/dsh-jupyterlab'
+      config: {}
