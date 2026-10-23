@@ -243,9 +243,10 @@ rmSync(stateDirectory, { recursive: true, force: true })
 
 // A disposed runtime must not leave kernel channels open behind it: this plugin lives in a
 // long-running host process, and a forgotten channel would keep a remote kernel attached forever.
-// (Sockets held by the global fetch agent's keep-alive pool are expected and drain on their own.)
+// (Sockets held by the keep-alive agents are expected and drain on their own; the process's own
+// stdio pipes are `PipeWrap` handles and were never the plugin's to close.)
 await new Promise((resolve) => setTimeout(resolve, 5000))
-const lingering = process.getActiveResourcesInfo().filter((kind) => kind !== 'Timeout')
+const lingering = process.getActiveResourcesInfo().filter((kind) => kind !== 'Timeout' && kind !== 'PipeWrap')
 await check('no kernel channel outlives the runtime', () => {
   assert.equal(runtime.openChannelCount, 0, 'the runtime still holds an open kernel channel')
 })

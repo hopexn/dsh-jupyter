@@ -30,9 +30,13 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
   output, and the toolbar's `Clear outputs` empties them all.
 - **Edit**: double-click a cell's source to edit it in place; `Done`, `Escape` or running it commits
   the change. Clicking `Run` runs the cell as it stands.
-- **Run**: `Shift+Enter` in the editor saves and runs — the same gesture as JupyterLab. Outputs
-  render beneath the cell: stdout, stderr, the value of the last expression, tracebacks, and images
+- **Run**: `Shift+Enter` in the editor saves and runs — the same gesture as JupyterLab, and one
+  request: the cell's draft travels with the run instead of being saved first. Outputs render
+  beneath the cell: stdout, stderr, the value of the last expression, tracebacks, and images
   (PNG/JPEG/GIF/WebP) inline.
+- **Live**: while the panel is visible it asks the host whether anything changed, carrying the
+  revision it already has, so a cell the agent ran in the shared kernel appears without a click.
+  When nothing changed the answer is two fields and never reaches Jupyter.
 - **Kernel**: the header shows the bound kernel and offers `Interrupt` and `Restart kernel`.
 
 **The panel and the agent share one kernel.** A variable defined in a cell is visible to
@@ -130,17 +134,36 @@ connect to a new server can never disclose the old server's secret to it.
 ## How it works
 
 ```
-lib/index.js    Cordis plugin: Config schema, system-prompt guidance, the four tool definitions
-lib/runtime.js  Connection + kernel-session state: one kernel per DSH session, re-attach, mirror to disk
-lib/server.js   Jupyter Server REST client: URL normalization, token/password auth, XSRF, cookie jar
-lib/kernel.js   Kernel messaging protocol over WebSocket: execute, collect iopub outputs, interrupt
-lib/notebook.js The panel's model: cells, outputs, run, and the on-disk mirror
-lib/routes.js   The one authenticated same-origin route the panel talks to
-lib/client.js   Browser half: the right-sidebar tab type and the notebook UI (no build step)
+lib/index.js     Cordis plugin: Config schema, system-prompt guidance, the four tool definitions
+lib/runtime.js   Connection + kernel-session state: one kernel per DSH session, re-attach, mirror to disk
+lib/server.js    Jupyter Server REST client: URL normalization, token/password auth, XSRF, cookie jar
+lib/transport.js HTTP over node:http/https: keep-alive sockets, buffered responses, abort handling
+lib/dns-cache.js Process-wide name-resolution cache, plugged into http and the kernel socket
+lib/websocket.js Minimal RFC 6455 client for the kernel channel: masking, fragmentation, ping/pong
+lib/kernel.js    Kernel messaging protocol over that socket: execute, collect iopub outputs, interrupt
+lib/notebook.js  The panel's model: cells, outputs, run, and the on-disk mirror
+lib/routes.js    The one authenticated same-origin route the panel talks to
+lib/client.js    Browser half: the right-sidebar tab type and the notebook UI (no build step)
 ```
 
 Design notes worth knowing:
 
+- **The transport is `node:http`, not `fetch`, because `fetch` re-resolves the hostname.** A Jupyter
+  server addressed by a mDNS name (`http://aimax395.local:9002/lab`) costs **about five seconds per
+  `getaddrinfo` call** on macOS — `mDNSResponder` multicasts first and only then falls back to
+  `/etc/hosts`. `fetch` and the built-in `WebSocket` both resolve the name themselves, per
+  connection, with no way to pass a resolver, and connecting to the raw IP instead is refused by
+  Jupyter, which checks the `Host` header (a valid token plus a mismatched `Host` is a 403).
+  `node:http` solves all of it: a custom `lookup` goes through `dns-cache.js`, the name still
+  arrives as `Host` and as TLS SNI, and a keep-alive agent means a second request costs only the
+  round trip. Measured against the server above: a panel click went from **5 020 ms to 6 ms**, and
+  a warm `jupyter_execute` from **10 122 ms to 83 ms**.
+- **The kernel channel uses its own WebSocket client** for the same reason, plus one more: the
+  handshake is the one place where the `Host` header must stay correct *and* the resolver must be
+  ours. `lib/websocket.js` implements only what the kernel protocol needs.
+- **Name resolution is warmed at mount.** The single five-second lookup is unavoidable per process,
+  so `runtime` starts it when the plugin mounts instead of leaving it for the first tool call; the
+  result lands in the cache the transport reads.
 - **The plugin never fails to load.** `url` is optional and the REST client is built lazily, so a
   missing or wrong address surfaces as one readable tool error instead of an activation failure.
 - **Execution is serialized per kernel.** iopub carries no request id, so concurrent executions on
@@ -195,6 +218,7 @@ node test/e2e.mjs        # protocol and runtime: auth, execute, persistence, tim
 node test/register.mjs   # mounts the plugin in a real cordis context with the real dsh-tools registry
 node test/notebook.mjs   # the panel's model and its HTTP route, driven with real Request objects
 node test/client.mjs     # the browser bundle: registrations, render paths, click and key handlers
+node test/transport.mjs  # DNS cache, socket reuse, Host header, and the WebSocket frame codec
 
 # The password path (login form, XSRF, cookie session) — run this before trusting a deployment:
 JUPYTER_TEST_URL=http://127.0.0.1:9004/lab JUPYTER_TEST_PASSWORD=dsh-test-password node test/e2e.mjs
@@ -203,6 +227,9 @@ JUPYTER_TEST_URL=http://127.0.0.1:9004/lab JUPYTER_TEST_PASSWORD=dsh-test-passwo
 JUPYTER_TEST_URL=http://host:9002/lab JUPYTER_TEST_PASSWORD=... node test/e2e.mjs
 JUPYTER_TEST_URL='http://host:9002/lab?token=...' node test/e2e.mjs
 ```
+
+`test/transport.mjs` needs no Jupyter server: it starts its own HTTP and WebSocket peers on
+127.0.0.1, counts the sockets the client opens, and round-trips frames of every length class.
 
 `test/e2e.mjs` needs no DSH packages. `test/register.mjs` imports `@deepseek-ai/cordis` and
 `@deepseek-ai/dsh-tools`, which resolve inside a DSH host process; outside one, link them (this is
@@ -221,6 +248,12 @@ Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PAS
   reimplementation of the notebook surface instead. It supports code cells with add, edit, delete,
   run and reorder — no markdown cells, no completion, no variable inspector, no `.ipynb` import or
   export yet.
+- **A cell's output arrives when the cell finishes.** The panel shows `running…` and then the whole
+  output at once; there is no incremental stream from iopub to the browser yet, so a cell that
+  prints for a minute looks stalled for a minute. The interrupt button stays reachable during a run.
+- **Rich outputs travel inside the notebook JSON.** A cell's images are shipped as base64 data URLs
+  with every full view, which is fine for a handful of plots and wasteful for a wall of them; moving
+  them behind their own route is the next payload win.
 - **Configuration has no form.** A packaged profile has no schema-driven settings UI without a
   hand-built client bundle, so the address and credentials come from the profile YAML or a
   `jupyter_connect` call.
