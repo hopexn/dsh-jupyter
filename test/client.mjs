@@ -71,6 +71,14 @@ function renderOutputs(tree) {
     .flatMap((node) => flatten(node.type(node.props)))
 }
 
+/** All text under a rendered node, the way the browser would concatenate it. */
+function textOf(node) {
+  if (node === null || node === undefined) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(textOf).join('')
+  return textOf(node.props?.children)
+}
+
 /** Minimal DOM so the bundle's style injection has somewhere to go. */
 function installDom() {
   const head = { children: [], appendChild(node) { head.children.push(node) } }
@@ -355,15 +363,16 @@ console.log('\ncell interaction')
 
 await check('a read-mode cell shows its source and offers the full action row', () => {
   const rendered = renderCell(page)
-  const sources = findAll(rendered, 'pre').filter((node) => node.props.children === 'print(1)')
+  const sources = findAll(rendered, 'pre').filter((node) => node.props.className === 'dshj-source')
   assert.equal(sources.length, 1, 'the source must be shown')
+  assert.equal(textOf(sources[0]), 'print(1)', 'the highlighted source must still read as its own text')
   assert.equal(findAll(rendered, 'textarea').length, 0, 'read mode must not show a textarea')
   const labels = findAll(rendered, 'button').map((node) => node.props.children)
   for (const label of ['run', '↑', '↓', '⌫', '✕']) assert.ok(labels.includes(label), `missing ${label} button in ${labels.join(',')}`)
 })
 await check('double-clicking the source starts editing', () => {
   const rendered = renderCell(page)
-  const source = findAll(rendered, 'pre').find((node) => node.props.children === 'print(1)')
+  const source = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
   assert.equal(typeof source.props.onDoubleClick, 'function', 'the source must be double-clickable')
   source.props.onDoubleClick()
 })
@@ -611,6 +620,138 @@ await check('a poll that changed nothing keeps the cell objects, so memo can ski
   } finally {
     globalThis.fetch = original
   }
+})
+
+console.log('\nhighlighting')
+
+await check('code is highlighted without changing its text', () => {
+  const source = 'def area(r):  # circle\n    return 3.14 * r ** 2\nprint(area("x"))'
+  const rendered = renderCell(page, cellOf({ source }))
+  const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+  assert.equal(textOf(pre), source, 'highlighting must not alter what the cell says')
+  const classes = findAll(pre, 'span').map((node) => node.props.className)
+  for (const cls of ['dshj-t-kw', 'dshj-t-def', 'dshj-t-com', 'dshj-t-num', 'dshj-t-str', 'dshj-t-fn']) {
+    assert.ok(classes.includes(cls), `missing ${cls} in ${classes.join('|')}`)
+  }
+})
+await check('a hash inside a string stays a string, and the comment after it is a comment', () => {
+  const rendered = renderCell(page, cellOf({ source: 'x = "# not a comment"  # comment' }))
+  const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+  const spans = findAll(pre, 'span')
+  assert.deepEqual(spans.filter((node) => node.props.className === 'dshj-t-str').map(textOf), ['"# not a comment"'])
+  assert.deepEqual(spans.filter((node) => node.props.className === 'dshj-t-com').map(textOf), ['# comment'])
+})
+await check('an IPython magic is recognised at a line start only', () => {
+  const rendered = renderCell(page, cellOf({ source: '%timeit sum(range(10))\nrem = 10 % 3' }))
+  const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+  const magic = findAll(pre, 'span').filter((node) => node.props.className === 'dshj-t-magic').map(textOf)
+  assert.equal(magic.length, 1, `only the magic line may be coloured: ${JSON.stringify(magic)}`)
+  assert.match(magic[0], /^%timeit/)
+})
+await check('edit mode puts the highlight layer under a transparent textarea', () => {
+  const notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cellOf()])
+  page.slots[4] = 'c1'
+  page.slots[5] = { c1: 'x = 1' }
+  const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
+  const rendered = node.type({ ...node.props, editing: 'c1', draft: 'x = 1' })
+  const layer = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-hl')
+  assert.ok(layer !== undefined, 'a highlight layer must sit under the editor')
+  assert.equal(textOf(layer).trimEnd(), 'x = 1')
+  const areas = findAll(rendered, 'textarea')
+  assert.equal(areas.length, 1)
+  assert.equal(areas[0].props.value, 'x = 1')
+  assert.equal(areas[0].props.className, 'dshj-editor')
+  assert.equal(typeof areas[0].props.onCompositionStart, 'function', 'an IME must be able to reveal the textarea text')
+})
+await check('tokenizing preserves every character of a tricky snippet', () => {
+  const corpus = [
+    'x = f"{a!r:>{w}}"',
+    's = """triple\nquoted # not a comment"""',
+    "t = r'\\d+' + 'it\\'s'",
+    '%matplotlib inline\nimport numpy as np',
+    '!ls -la',
+    'def f(x: int = 0x1F) -> None:\n    """doc"""\n    return x',
+    'a = 1_000.5e-3 + 2j',
+    '@decorator(arg)\nclass C(Base): ...',
+    'ünïcode = "∑"  # 中文注释',
+    'values = [i ** 2 for i in range(10) if i % 2]',
+  ]
+  for (const source of corpus) {
+    const rendered = renderCell(page, cellOf({ source }))
+    const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+    assert.equal(textOf(pre), source, `tokenizing changed ${JSON.stringify(source)}`)
+  }
+})
+
+console.log('\nmarkdown and rich output')
+
+await check('a markdown cell renders its markdown and offers Render instead of Run', () => {
+  const rendered = renderCell(page, cellOf({ kind: 'markdown', source: '# Title\n\n**bold** text\n\n- one\n- two' }))
+  // The harness leaves child components as elements; a markdown block is one, so call it.
+  const markdown = flatten(rendered).find((node) => typeof node.type === 'function' && node.props?.source !== undefined)
+  assert.ok(markdown !== undefined, 'the cell body must reach the Markdown component')
+  const tree = markdown.type(markdown.props)
+  assert.equal(findAll(tree, 'h1').length, 1, 'the heading must render as a heading')
+  assert.equal(textOf(findAll(tree, 'strong')[0]), 'bold')
+  assert.equal(findAll(tree, 'li').length, 2)
+  const labels = findAll(rendered, 'button').map((node) => node.props.children)
+  assert.ok(labels.includes('render'), `a markdown cell renders: ${labels.join(',')}`)
+  assert.ok(!labels.includes('run'), 'it must not offer to run prose through the kernel')
+  assert.equal(labels[0], 'MD', 'the kind chip must say what the cell is')
+})
+await check('a markdown cell edits as plain text rather than highlighted code', () => {
+  const notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cellOf({ kind: 'markdown', source: '# Title' })])
+  page.slots[4] = 'c1'
+  page.slots[5] = { c1: '# Title' }
+  const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
+  const rendered = node.type({ ...node.props, editing: 'c1', draft: '# Title' })
+  assert.equal(findAll(rendered, 'pre').filter((node) => node.props.className === 'dshj-hl').length, 0)
+  assert.equal(findAll(rendered, 'textarea').length, 1)
+})
+await check('a text/markdown output renders as markdown, tables included', () => {
+  const rendered = renderCell(page, cellOf({
+    outputs: [{ type: 'markdown', text: '## Result\n\n| a | b |\n| --- | --- |\n| 1 | 2 |' }],
+  }))
+  const block = renderOutputs(rendered).find((node) => typeof node.type === 'function' && node.props?.source !== undefined)
+  assert.ok(block !== undefined, 'the markdown output must reach a Markdown component')
+  const tree = block.type(block.props)
+  assert.equal(findAll(tree, 'h2').length, 1)
+  assert.equal(findAll(tree, 'table').length, 1)
+  assert.equal(findAll(tree, 'td').length, 2)
+})
+await check('a fenced python block in markdown is highlighted too', () => {
+  const rendered = renderCell(page, cellOf({ kind: 'markdown', source: '```python\nx = 1\n```' }))
+  const markdown = flatten(rendered).find((node) => typeof node.type === 'function' && node.props?.source !== undefined)
+  const tree = markdown.type(markdown.props)
+  const code = findAll(tree, 'code')[0]
+  assert.ok(code !== undefined, 'the fence must become a code block')
+  assert.ok(findAll(code, 'span').some((node) => node.props.className === 'dshj-t-num'), 'its numbers must be coloured')
+})
+await check('a text/html output is mounted in its own shadow host', () => {
+  const rendered = renderCell(page, cellOf({ outputs: [{ type: 'html', text: '<table><tr><td>1</td></tr></table>' }] }))
+  const host = renderOutputs(rendered).find((node) => typeof node.type === 'function' && node.props?.html !== undefined)
+  assert.ok(host !== undefined, 'html output must go through the sanitizing host')
+  const div = host.type(host.props)
+  assert.equal(div.type, 'div')
+  assert.equal(div.props.className, 'dshj-html')
+  assert.notEqual(div.props.ref, undefined, 'the host needs a ref to attach its shadow root to')
+})
+await check('the kind chip switches a cell between code and markdown', () => {
+  const notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cellOf()])
+  const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
+  const seen = []
+  const rendered = node.type({ ...node.props, onKind: (id, kind) => seen.push([id, kind]) })
+  findAll(rendered, 'button').find((button) => button.props.children === 'Py').props.onClick()
+  assert.deepEqual(seen, [['c1', 'markdown']])
 })
 
 console.log('\nentry point')

@@ -57,6 +57,28 @@ function fakeRuntime() {
         outputs: [{ kind: 'result', data: { 'text/plain': '<Figure>', 'image/png': 'aGVsbG8=' } }],
       }
     }
+    if (code.includes('frame')) {
+      return {
+        status: 'ok',
+        executionCount: next++,
+        durationMs: 9,
+        outputs: [{
+          kind: 'result',
+          data: {
+            'text/plain': '   a  b\n0  1  2',
+            'text/html': '<table class="dataframe"><tbody><tr><td>1</td><td>2</td></tr></tbody></table>',
+          },
+        }],
+      }
+    }
+    if (code.includes('richmarkdown')) {
+      return {
+        status: 'ok',
+        executionCount: next++,
+        durationMs: 9,
+        outputs: [{ kind: 'result', data: { 'text/plain': '# Title', 'text/markdown': '# Title' } }],
+      }
+    }
     if (code.includes('slow')) {
       return { status: 'timeout', message: 'no result within 2000ms; the kernel was interrupted', executionCount: null, durationMs: 2000, outputs: [{ kind: 'stream', name: 'stdout', text: 'partial\n' }] }
     }
@@ -179,6 +201,50 @@ await check('an image result is delivered as a data URL beside its text', async 
   const types = view.cells[0].outputs.map((output) => output.type)
   assert.deepEqual(types, ['text', 'image'])
   assert.equal(view.cells[0].outputs[1].dataUrl, 'data:image/png;base64,aGVsbG8=')
+})
+
+await check('a DataFrame result renders as HTML instead of its plain-text repr', async () => {
+  const cell = (await notebooks.view(SESSION)).cells[0]
+  await notebooks.command(SESSION, { action: 'updateCell', id: cell.id, source: 'frame' })
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.idle(SESSION)
+  const view = await notebooks.view(SESSION)
+  assert.deepEqual(view.cells[0].outputs.map((output) => output.type), ['html'])
+  assert.match(view.cells[0].outputs[0].text, /<table class="dataframe">/)
+  assert.equal(view.cells[0].outputs[0].text.includes('   a  b'), false, 'the plain repr must not be shown beside the table')
+})
+
+await check('a text/markdown result renders as markdown', async () => {
+  const cell = (await notebooks.view(SESSION)).cells[0]
+  await notebooks.command(SESSION, { action: 'updateCell', id: cell.id, source: 'richmarkdown' })
+  await notebooks.command(SESSION, { action: 'runCell', id: cell.id })
+  await notebooks.idle(SESSION)
+  const view = await notebooks.view(SESSION)
+  assert.deepEqual(view.cells[0].outputs, [{ type: 'markdown', text: '# Title' }])
+})
+
+await check('markup past the HTML cap falls back to the text it came with', () => {
+  const huge = `<table>${'<tr><td>x</td></tr>'.repeat(20_000)}</table>`
+  const outputs = renderableOutputs([{ kind: 'result', data: { 'text/plain': 'too big', 'text/html': huge } }])
+  assert.equal(outputs.length, 2, JSON.stringify(outputs.map((output) => output.type)))
+  assert.equal(outputs[0].type, 'text')
+  assert.match(outputs[0].text, /text\/html output omitted/)
+  assert.equal(outputs[1].text, 'too big')
+})
+
+await check('a markdown cell renders without waking the kernel', async () => {
+  const notebook = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const cell = (await notebook.view(SESSION)).cells[0]
+  await notebook.command(SESSION, { action: 'updateCell', id: cell.id, kind: 'markdown' })
+  const before = fake.calls.length
+  await notebook.command(SESSION, { action: 'runCell', id: cell.id, source: '# Title' })
+  await notebook.idle(SESSION)
+  const view = await notebook.view(SESSION)
+  assert.equal(view.cells[0].kind, 'markdown')
+  assert.equal(view.cells[0].status, 'ok')
+  assert.deepEqual(view.cells[0].outputs, [])
+  assert.equal(fake.calls.length, before, 'markdown must never reach the kernel')
+  notebook.dispose()
 })
 
 await check('a timeout keeps the partial output and explains itself', async () => {
