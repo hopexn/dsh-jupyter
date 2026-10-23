@@ -215,6 +215,33 @@ function installEventSource() {
 }
 
 /**
+ * A recording `fetch`, so a click can be inspected without a host.
+ *
+ * Answers with the view it was given, at a revision high enough to pass the panel's "older than
+ * what I already have" guard — the guard is module-level state shared by every test in this file.
+ */
+function installFetch(view) {
+  const calls = []
+  globalThis.fetch = async (url, options = {}) => {
+    const command = options.body === undefined ? null : JSON.parse(options.body)
+    calls.push({ url: String(url), command })
+    return { status: 200, json: async () => ({ ...view, revision: (view.revision ?? 0) + (calls.length) }) }
+  }
+  return { calls, restore: () => { delete globalThis.fetch } }
+}
+
+/** A stand-in for the tab's `sessionStorage`, which a draft is written to. */
+function installSessionStorage(initial = {}) {
+  const map = new Map(Object.entries(initial))
+  globalThis.sessionStorage = {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => { map.set(key, String(value)) },
+    removeItem: (key) => { map.delete(key) },
+  }
+  return { map, restore: () => { delete globalThis.sessionStorage } }
+}
+
+/**
  * Render the panel with a primed view, then render one of its cells directly.
  * @returns The cell's rendered tree.
  */
@@ -256,7 +283,7 @@ await check('it registers both dictionaries with every key the UI asks for', () 
   assert.equal(page.registered.locales[0].ns, 'jupyterlab')
   assert.deepEqual(Object.keys(page.registered.locales[0].dicts).sort(), ['en', 'zh'])
   const english = page.registered.locales[0].dicts.en
-  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell']) {
+  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss']) {
     assert.equal(typeof english[key], 'string', `missing translation "${key}"`)
   }
 })
@@ -735,6 +762,174 @@ await check('an agent-created cell is marked, a user cell is not', () => {
   assert.equal(textOf(chip), 'agent')
   const userCell = renderCell(page, cellOf())
   assert.equal(flatten(userCell).find((node) => node.props?.className === 'dshj-origin'), undefined)
+})
+
+console.log('\nrun all, import, and drafts')
+
+/** Render the panel twice so effects that set state have landed, the way a real re-render would. */
+function panelTree(props) {
+  const Notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  Notebook(props)
+  page.React.reset()
+  return Notebook(props)
+}
+
+/** A button or link by its visible text. */
+function byText(tree, text) {
+  return flatten(tree).find((node) => (node.type === 'button' || node.type === 'a') && textOf(node) === text)
+}
+
+await check('the toolbar runs every cell, and turns into a stop while a sequence is going', async () => {
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 90 }))
+  try {
+    const idle = panelTree({ sessionId: 's1', t: (key) => key })
+    const runAll = byText(idle, 'runAll')
+    assert.ok(runAll !== undefined, 'an idle panel offers "run all"')
+    assert.equal(byText(idle, 'stopRunAll'), undefined)
+    await runAll.props.onClick()
+    await tick()
+    // The first call is the panel's initial read; only commands carry an action.
+    assert.deepEqual(fetchState.calls.filter((call) => call.command !== null).map((call) => call.command.action), ['runAll'])
+
+    // The host says a sequence is going: the same slot becomes the way out of it.
+    page.React.reset()
+    page.slots.length = 0
+    page.slots[0] = viewOf([cellOf()], { revision: 96, runningAll: true })
+    page.React.reset()
+    const stopping = page.component('sidebar.right.pane.tab')({ sessionId: 's1', t: (key) => key })
+    const stop = byText(stopping, 'stopRunAll')
+    assert.ok(stop !== undefined, 'a running sequence must offer a stop')
+    assert.equal(byText(stopping, 'runAll'), undefined)
+    await stop.props.onClick()
+    await tick()
+    assert.equal(fetchState.calls[fetchState.calls.length - 1].command.action, 'interrupt')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a cell can add another one directly below it', async () => {
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 91 }))
+  try {
+    const rendered = renderCell(page, cellOf({ id: 'c9' }))
+    const insert = flatten(rendered).find((node) => node.props?.['aria-label'] === 'insertBelow')
+    assert.ok(insert !== undefined, 'every cell offers an insert-below control')
+    await insert.props.onClick()
+    await tick()
+    const commands = fetchState.calls.filter((call) => call.command !== null).map((call) => call.command)
+    assert.deepEqual(commands[commands.length - 1], { action: 'addCell', afterId: 'c9', sessionId: 's1' })
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a long output starts folded, and unfolds on one click', () => {
+  const text = Array.from({ length: 60 }, (_, index) => `line ${index}`).join('\n')
+  const rendered = renderCell(page, cellOf({ outputs: [{ type: 'text', text }] }))
+  const outputNode = findComponent(rendered, (props) => props.output?.type === 'text')
+  assert.ok(outputNode !== undefined)
+  page.React.reset()
+  const fold = outputNode.type(outputNode.props)
+  // Output wraps the pre in a Collapsible element; rendering that gives the host nodes. Its state
+  // is the first slot, so it has to start from an empty one.
+  page.React.reset()
+  page.slots.length = 0
+  const closed = fold.type(fold.props)
+  assert.equal(closed.props['data-open'], 'false', 'a 60-line output is folded')
+  const more = flatten(closed).find((node) => node.type === 'button')
+  assert.equal(textOf(more), 'showMore')
+  more.props.onClick()
+  page.React.reset()
+  const opened = fold.type(fold.props)
+  assert.equal(opened.props['data-open'], 'true')
+  assert.equal(textOf(flatten(opened).find((node) => node.type === 'button')), 'showLess')
+})
+
+await check('a short output is not folded at all', () => {
+  const rendered = renderCell(page, cellOf({ outputs: [{ type: 'text', text: 'ok' }] }))
+  const outputNode = findComponent(rendered, (props) => props.output?.type === 'text')
+  page.React.reset()
+  const fold = outputNode.type(outputNode.props)
+  assert.equal(fold.props.long, false)
+  page.React.reset()
+  page.slots.length = 0
+  const host = fold.type(fold.props)
+  assert.equal(host.props['data-open'], 'true', 'nothing to open')
+  assert.equal(flatten(host).filter((node) => node.type === 'button').length, 0)
+})
+
+await check('an import replaces the whole list in one streamed event', () => {
+  const source = installEventSource()
+  try {
+    const props = { sessionId: 's1', t: (key) => key }
+    page.React.reset()
+    page.slots.length = 0
+    page.slots[0] = viewOf([cellOf()], { revision: 70 })
+    page.component('sidebar.right.pane.tab')(props)
+    assert.equal(source.instances.length, 1, 'the panel opens one stream')
+    source.instances[0].emit({ type: 'replace', revision: 71, cells: [cellOf({ id: 'z1', source: 'imported = True' }), cellOf({ id: 'z2', kind: 'markdown', source: 'prose' })] })
+    page.React.reset()
+    const tree = page.component('sidebar.right.pane.tab')(props)
+    const cells = flatten(tree).filter((node) => node.props?.cell !== undefined && typeof node.type === 'function')
+    assert.deepEqual(cells.map((node) => node.props.cell.id), ['z1', 'z2'])
+    assert.equal(cells[1].props.cell.kind, 'markdown')
+  } finally {
+    source.restore()
+  }
+})
+
+await check('a run-all event flips the toolbar without a revision bump', () => {
+  const source = installEventSource()
+  try {
+    const props = { sessionId: 's1', t: (key) => key }
+    page.React.reset()
+    page.slots.length = 0
+    page.slots[0] = viewOf([cellOf()], { revision: 80 })
+    page.component('sidebar.right.pane.tab')(props)
+    source.instances[0].emit({ type: 'runall', running: true, revision: 80 })
+    page.React.reset()
+    const tree = page.component('sidebar.right.pane.tab')(props)
+    assert.ok(byText(tree, 'stopRunAll') !== undefined)
+    assert.equal(byText(tree, 'runAll'), undefined)
+  } finally {
+    source.restore()
+  }
+})
+
+await check('an unsaved draft is back after a reload, in its editor', () => {
+  const storage = installSessionStorage({
+    'dshj:draft:s1': JSON.stringify({ editing: 'c1', drafts: { c1: 'print("half written' } }),
+  })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 92 }))
+  try {
+    const tree = panelTree({ sessionId: 's1', t: (key) => key })
+    const node = findComponent(tree, (props) => props.cell?.id === 'c1')
+    assert.equal(node.props.draft, 'print("half written', 'the text the host never received')
+    assert.equal(node.props.editing, 'c1', 'and the editor reopened where the user left it')
+    // Writing the draft never went through a command: it is client state, not notebook state.
+    assert.ok(fetchState.calls.every((call) => call.command === null), 'no draft ever reaches the host')
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
+})
+
+await check('a draft for a cell that no longer exists is dropped, not resurrected', async () => {
+  const storage = installSessionStorage({
+    'dshj:draft:s1': JSON.stringify({ editing: null, drafts: { gone: 'orphan text' } }),
+  })
+  const fetchState = installFetch(viewOf([cellOf({ id: 'c1' })], { revision: 93 }))
+  try {
+    panelTree({ sessionId: 's1', t: (key) => key })
+    await tick()
+    const saved = storage.map.get('dshj:draft:s1')
+    // Either removed, or stored without the orphan — never carried into a later session.
+    assert.equal(saved === undefined || !JSON.parse(saved).drafts.gone, true)
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
 })
 
 console.log('\nhighlighting')
