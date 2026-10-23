@@ -256,6 +256,16 @@ Design notes worth knowing:
   can affect the panel. It is the same trick JupyterLab uses an iframe for, without the iframe's
   fixed height.
 
+## Documentation
+
+- **`docs/design.md`** — the design and the index: how the two halves fit together, where each
+  concern lives (file + symbol), and the reasons behind the decisions that look odd. **Read it
+  first when changing code**; `AGENTS.md` gives agents the same instruction.
+- **`docs/performance-review.md`** — what was slow, what was measured, what changed, and the
+  headroom that is still open.
+- **`docs/dsh-client-plugin-contract.md`** — the host/plugin contract this panel was built
+  against, extracted from the shipped packages as reference.
+
 ## Verifying a change
 
 Two test suites run against a live Jupyter server. Start a throwaway one **without** weakening

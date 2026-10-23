@@ -174,6 +174,51 @@ clear 事件、图片走 URL、poll 不改变对象身份）。
 
 全套：transport 14 / notebook 33 / client 30 / e2e 29 / register 21 = **127 项全绿**。
 
+## 第三轮：渲染（高亮 / Markdown / 富输出）
+
+这一轮不追吞吐，追的是"面板能看见什么"。性能上的判断只有三条：
+
+### A. 高亮用分词器，不用 parser
+
+没有构建步骤、没有客户端依赖，所以 highlight.js / Prism 这类东西不可用。一次全局正则按优先级
+出 token（行首 magic → 注释 → 字符串 → 装饰器 → 数字 → 标识符 → 运算符），再做一遍
+"`def`/`class` 之后是名字、`(` 之前是调用"的二次标记。
+
+成本是每次重绘对单元格源码扫一遍，O(字符数)，没有语法树。正确性的下限是**字符串里的 `#`
+不能被当成注释**——这是唯一会让代码读错的地方；f-string 内部表达式、括号深度明确不做。
+
+编辑器不改输入路径：透明 textarea 盖在高亮副本上，光标、选区、IME 都是原生行为；组字期间
+（`data-composing`）把高亮层藏起来，让 textarea 自己的字显示出来，否则拼音候选看不见。
+
+### B. HTML 输出挂 shadow root，不用 iframe
+
+`text/html` 是 pandas / polars / Styler 的默认表示。两条路：
+
+| 方案 | 代价 |
+| --- | --- |
+| iframe + `srcdoc` | 高度必须写死（或 postMessage 量高），每条输出多一个文档 |
+| shadow root | 无额外文档，自然高度，CSS 完全隔离 |
+
+选后者：`DOMParser` 解析 → 洗掉 `script`/`iframe`/`object`/`link`/`meta`/`base`/`form`、
+所有 `on*`、`srcdoc`、`javascript:`（含 `<style>` 里的 `@import`）→ 挂到 shadow root。
+链接在 scheme 检查之后补 `target`/`rel`，否则点一下就把整个对话页导航走了。
+
+### C. 富输出有预算，超了退回纯文本
+
+`MAX_HTML_BYTES` 256 KiB、`MAX_TEXT_PER_CELL` 200 000 字符、`MAX_IMAGES_PER_CELL` 8、
+`MAX_IMAGE_BYTES` 2 MiB。视图每次点击都要重发，所以宁可退回纯文本并留一行说明，也不把
+一份 5 MiB 的 HTML 塞进每一次 `view()`。
+
+### 实测与回归
+
+- `df` 在真内核上产出**一条 644 字节的 `text/html`**，`display(df)` 相同；渲染进 shadow root
+  后是一张真表格，不再是等宽字符画。
+- markdown 单元格的 `runCell` **14 ms** 返回，不启动内核、不产生执行计数。
+- jsdom + 真 React 挂载面板：表格在 `shadowRoot` 内；敌意输出跑完 `window.pwned` 仍是
+  `undefined`；两层编辑器的 `font`/`padding` 计算值相等。
+- 套件：notebook 33 → 37，client 30 → 41；五套 14 / 37 / 41 / 29 / 21 = **142 项全绿**。
+  2026-10-24 又离线复跑前三套：14 / 37 / 41 = 92 项全绿。
+
 ## 还剩下的空间
 
 按收益排，都不如上面三项大：
@@ -186,12 +231,19 @@ clear 事件、图片走 URL、poll 不改变对象身份）。
    "写文件 + 报路径"。
 4. **`maybeComplete` 的 2 秒宽限与 `interruptAndSettle` 的 3 秒兜底**：只在异常路径出现，
    正常路径不受影响。
-5. **虚拟滚动**：见 C，等真有上百单元格的实际反馈再决定。
+5. **虚拟滚动**：见第二轮 C，`memo` 之后每帧只重渲染一格，等真有上百单元格的实际反馈再决定。
+6. **剩下的 MIME**：`application/json` 与 LaTeX 现在只报类型名。要画，得各写一个渲染器，
+   而 LaTeX 还要额外引入一个排版库——与"无构建、无依赖"冲突，暂时不做。
+7. **`.ipynb` 导入导出**：Contents API 没接，单元格的 `path` 字段目前只是占位。要做的话，
+   落点分别在 `lib/server.js`（读写文件）和 `lib/notebook.js`（格式转换）。
 
 ## 复测方法
 
 ```bash
-# 传输层（无需 Jupyter）
+# 三套离线套件（不需要 Jupyter）
+node test/transport.mjs && node test/notebook.mjs && node test/client.mjs
+
+# 传输层单跑
 node test/transport.mjs
 
 # 真实服务器上的端到端对比（BEFORE 用快照 worktree）
