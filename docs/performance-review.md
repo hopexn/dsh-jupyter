@@ -86,56 +86,107 @@ IP 字面量不解析、**5 次请求只开 1 条 TCP 连接**、`Host` 保持�
 回归：`client.mjs` 26 项、`notebook.mjs` 26 项、`e2e.mjs` 29 项全绿（`e2e.mjs` 里
 `no sockets outlive the runtime` 在本机原本就会把进程自己的 stdio 管道算进去，已排除 `PipeWrap`）。
 
-## 还剩下的空间（按收益排序）
+## 第二轮：把剩下的空间做完（同日晚）
 
-### A. 单元格输出流式回传 —— 收益最大
+上一轮把"每次请求 5 秒"变成"每进程 5 秒"。这一轮处理报告里按收益排的前三项，外加渲染和
+两处小账。
 
-现状：`runCell` 一个 POST 顶到执行结束才回，中途只有 `running…`。跑 60 秒的单元格，用户盯着
-60 秒的空白。内核本来就在 iopub 上逐块给数据，缺的是这一段通路。
+### A. 输出流式回传（原第 1 项，收益最大）
 
-建议：`GET /api/jupyterlab/notebook/stream?sessionId=…` 用 SSE，把 `stream` / `display_data` /
-`error` 增量推给浏览器；`POST runCell` 立刻返回（命令已受理），输出走 SSE 补齐。风险：多一条长连接
-的生命周期管理，以及宿主 route 是否支持流式响应需要确认。
+链路：`execute_request` → iopub 逐条消息 → `KernelConnection.execute({ onOutput })` →
+`Notebooks` 的 `OutputRenderer` 增量渲染 → 每个会话的事件订阅 → SSE 路由 → 浏览器。
 
-### B. 图片不再塞进笔记本 JSON
+关键决定：**执行归模型所有，不归请求所有。** `POST runCell` 在 20 ms 内返回，执行在后台继续，
+不再有"请求断了所以单元格被杀"的问题——原来刷新页面会 abort 掉 POST，那个 signal 一路接到
+`POST /api/kernels/<id>/interrupt`，等于刷新即中断。
 
-现状：每个单元格最多 8 张图、每张 2 MiB，全部 base64 内联在 `view()` 里。没有图时无所谓，一旦
-有图，每次完整回传都是几 MB 的序列化 + 传输。
-
-建议：`GET /api/jupyterlab/asset/<cellId>/<index>` 输出二进制并带 `immutable` 缓存头，单元格里只留
-URL 和尺寸；`?since=` 已经保证了轮询不重传。收益：图多的笔记本从 MB 级回传降到 KB 级。
-
-### C. 再省掉进程里那次 5 秒
-
-mDNS 解析一次就够（已预热），但进程重启后还会再付一次。彻底的办法是不要 `.local`：
+实测（真内核，`print(i); time.sleep(0.6)` ×5，本地 9003，`scripts/bench-stream.mjs`）：
 
 ```
-# /etc/hosts 里加一个不带 .local 的别名
-192.168.5.200  aimax395
+runCell answered after 22 ms (still running: true)
+    16 ms  cell   "running"
+   315 ms  text   "0\n"
+   929 ms  text   "1\n"
+  1540 ms  text   "2\n"
+  2149 ms  text   "3\n"
+  2760 ms  text   "4\n"
+  3368 ms  text   "'done'"
+  3401 ms  cell   "ok"
 ```
 
-然后把 `url` 配成 `http://aimax395:9002/lab`。不带 `.local` 的名字走 `/etc/hosts` 是毫秒级。
-（这条是环境建议，插件不再依赖它 —— DNS 缓存已经让"每请求 5 秒"变成"每进程 5 秒"。）
+改造前：这一格要 3 401 ms 才有第一次响应，中途面板只有一个 `running…`。
 
-### D. 长笔记本的渲染成本
+实现细节：
 
-现在每次 `view` 变化都会重算所有 `Cell`。几十个单元格无感；上百个 + 多张图时，React 侧的 diff
-会成为新的瓶颈。建议 `React.memo` 包 `Cell`（props 已经是纯数据），必要时再上虚拟滚动。
+- SSE 帧按 60 ms 合并。一个 print 循环能在一秒里产生上百条 iopub 消息，一条一帧的框架开销比
+  它喂的渲染还贵。`cell`（开始/结束）事件不合并，立即下发。
+- 增量渲染把**连续同名 stream 合并成一个节点**，否则一千次 print 就是一千个 `<pre>`。
+  这一条对 `renderableOutputs` 同样生效，批量与增量两条路径结果一致。
+- 结束时用内核的完整输出列表**重算一次**，所以落盘和留存的状态与"非流式"完全一致；增量那份
+  只是给人看的。
+- 心跳 25 秒一次注释帧；请求 abort 时释放订阅与计时器，反复开关面板不留东西。
 
-### E. 页面刷新会打断正在跑的单元格
+### B. 图片不再进笔记本 JSON（原第 2 项）
 
-`routes.js` 把 `request.signal` 一路传到内核，浏览器取消请求（刷新、关标签）会转成 interrupt。
-多数人希望刷新后单元格继续跑完。建议：面板发起的执行不绑定 `request.signal`，只保留宿主超时；
-中断交给显式的"中断"按钮。
+`lib/assets.js`：按内容哈希落盘（`$DSH_HOME/jupyterlab/assets/<sha256 前 20 位>.<ext>`），
+单元格里只留 `api/jupyterlab/asset?name=<hash>.png`，路由带 `immutable`，浏览器永久缓存。
+同一张图重绘一次复用同一个 URL；内存 32 MiB LRU，磁盘 256 MiB 上限并按最旧优先清理。
 
-### F. 其它小账
+实测（一格 4 张图，每张 base64 933 KiB，`scripts/bench-payload.mjs`）：
 
-- `jupyter_status` 报告的 `version` 在 jupyter_server 2.x 上恒为空（`/api/status` 不含该字段，
-  `/api/version` 是 404）。要么去掉，要么从别处取。
-- `maybeComplete` 在缺少 `idle` 状态时有 2 秒宽限，`interruptAndSettle` 有 3 秒兜底 —— 只在异常
-  路径上出现，正常路径不受影响。
-- `maxOutputChars` 默认 2 万字符，超出按头 6/尾 4 截断；大输出更适合"写文件 + 报路径"。
-- 一个内核只允许一个 DSH 会话绑定；多会话想共享同一内核，需要把 binding 从 session 提到 profile。
+| `view()` 载荷 | 大小 |
+| --- | --- |
+| 改造前（data URL 内联） | 3 734 KiB |
+| 改造后（资源 URL） | **1 KiB** |
+
+注意路由是**精确路径**匹配（宿主 `connection.fetch` 就是精确注册表），所以名字走 query 而不是
+路径段——`/api/jupyterlab/asset/<name>` 会 404。
+
+### C. `React.memo` 与长笔记本（原第 4 项）
+
+`Cell` 包了 `React.memo`，但要它真的生效还需要两件事：
+
+1. **对象身份**：每次 `view()` 都是新解析的 JSON。每个单元格加了 `rev` 计数，拉回来的视图在
+   `rev` 未变（且不在运行中）时复用上一个对象，于是没变的单元格引用相等。
+2. **回调稳定**：原来每个单元格拿到 8 个内联箭头函数，永远不相等。改成 `useCallback` +
+   `useRef` 读当前状态，引用恒定。
+
+没有这两条，`memo` 只会多一层比较然后照样全量重渲染。虚拟滚动没做：`memo` 之后每个 SSE 帧
+只会重渲染一个单元格，实测值不值得再引入一套行高测量与滚动同步，留作后续。
+
+### D. 顺带修掉的小账
+
+- **刷新不再打断单元格**：见 A，`runCell` 不再带 `request.signal`。
+- **`jupyter_status` 的 `version` 恒为空**：`/api/status` 在 jupyter_server 2.x 上确实没有这个
+  字段，`/api/version` 是 404；但 **`GET /api` 返回 `{"version":"2.21.1"}`**。改成并行取
+  `/api`，实测输出 `version: "2.21.1"`。
+- **`/etc/hosts` 别名**：环境里 `/etc/hosts` 只有 `192.168.5.200 aimax395.local`，不带 `.local`
+  的名字仍未定义，而改 hosts 需要 root。给了幂等脚本 `scripts/alias-host.sh`（自动备份，
+  `dscacheutil -flushcache` + `killall -HUP mDNSResponder`），一条命令即可：
+  `sudo scripts/alias-host.sh aimax395 192.168.5.200`。**这条没有在本机执行**（沙箱里 sudo 不可用），
+  需要你自己跑一次，然后把 `url` 换成 `http://aimax395:9002/lab`。
+
+### 测试
+
+`test/notebook.mjs` 26 → 33 项（后台执行不阻塞、事件顺序、取消订阅、资源存储去重与路径穿越、
+SSE 路由真的推帧、资源路由的 immutable 头与 404）；`test/client.mjs` 26 → 30 项（流式补丁、
+clear 事件、图片走 URL、poll 不改变对象身份）。
+
+全套：transport 14 / notebook 33 / client 30 / e2e 29 / register 21 = **127 项全绿**。
+
+## 还剩下的空间
+
+按收益排，都不如上面三项大：
+
+1. **多会话共享一个内核。** 现在一个内核只允许一个 DSH 会话绑定；要共享需要把 binding 从
+   session 提到 profile。属于能力扩展，不是性能。
+2. **`jupyter_execute` 自己还没有流式**。面板有了，工具面（模型看结果）仍是一次性返回；
+   对 agent 来说通常更好（少一轮）、但跑长任务时模型无法中途看到进度。
+3. **输出落盘策略**。`maxOutputChars` 默认 2 万字符，超出按头 6/尾 4 截断；大输出更适合
+   "写文件 + 报路径"。
+4. **`maybeComplete` 的 2 秒宽限与 `interruptAndSettle` 的 3 秒兜底**：只在异常路径出现，
+   正常路径不受影响。
+5. **虚拟滚动**：见 C，等真有上百单元格的实际反馈再决定。
 
 ## 复测方法
 
@@ -147,6 +198,10 @@ node test/transport.mjs
 git worktree add /tmp/dsh-old cf1f252
 node /tmp/jl-cmp2.mjs /tmp/dsh-old/lib                     # 旧
 node /tmp/jl-cmp2.mjs "$PWD/lib"                           # 新
-```
 
-`jl-cmp2.mjs` 的三段分别是：首次执行（含内核握手）、5 次面板视图、一次热执行。
+# 流式：真内核上打印 5 行、每行间隔 0.6 秒，看首帧时间与命令返回时间
+JUPYTER_URL=http://127.0.0.1:9003/lab JUPYTER_TOKEN=... node scripts/bench-stream.mjs
+
+# 图片载荷：同一格 4 张图，比较 view() 的字节数（不需要服务器）
+node scripts/bench-payload.mjs
+```

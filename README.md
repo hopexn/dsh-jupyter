@@ -33,10 +33,13 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
 - **Run**: `Shift+Enter` in the editor saves and runs — the same gesture as JupyterLab, and one
   request: the cell's draft travels with the run instead of being saved first. Outputs render
   beneath the cell: stdout, stderr, the value of the last expression, tracebacks, and images
-  (PNG/JPEG/GIF/WebP) inline.
-- **Live**: while the panel is visible it asks the host whether anything changed, carrying the
-  revision it already has, so a cell the agent ran in the shared kernel appears without a click.
-  When nothing changed the answer is two fields and never reaches Jupyter.
+  (PNG/JPEG/GIF/WebP).
+- **Watched while it runs**: `Run` answers as soon as the kernel has the code, and the output is
+  pushed to the panel over a stream as it is produced. A cell that prints for a minute shows its
+  first line after a second, and closing or reloading the page does not stop it.
+- **Live**: while the panel is visible it also polls the host, carrying the revision it already has,
+  so a cell the agent ran in the shared kernel appears without a click. When nothing changed the
+  answer is two fields and never reaches Jupyter.
 - **Kernel**: the header shows the bound kernel and offers `Interrupt` and `Restart kernel`.
 
 **The panel and the agent share one kernel.** A variable defined in a cell is visible to
@@ -131,6 +134,20 @@ connect to a new server can never disclose the old server's secret to it.
 | `maxOutputChars` | `20000` | Streamed output kept per execution (head and tail). |
 | `artifactDirectory` | `$DSH_HOME/jupyterlab/artifacts` | Where image/PDF outputs are written. |
 
+### If the address is a `.local` name
+
+On macOS, resolving a `host.local` name takes about five seconds: `mDNSResponder` multicasts first
+and only then falls back to `/etc/hosts`. The plugin pays that once per process (the cache is warmed
+at mount, and every later request or kernel handshake reuses it), never per click. To remove even
+that one, give the machine a name without the `.local` suffix:
+
+```bash
+sudo scripts/alias-host.sh aimax395 192.168.5.200   # /etc/hosts: 192.168.5.200 aimax395
+```
+
+then set `url: http://aimax395:9002/lab`. The script is idempotent and backs up `/etc/hosts` before
+touching it. It is a convenience for this machine, not part of the package.
+
 ## How it works
 
 ```
@@ -140,9 +157,10 @@ lib/server.js    Jupyter Server REST client: URL normalization, token/password a
 lib/transport.js HTTP over node:http/https: keep-alive sockets, buffered responses, abort handling
 lib/dns-cache.js Process-wide name-resolution cache, plugged into http and the kernel socket
 lib/websocket.js Minimal RFC 6455 client for the kernel channel: masking, fragmentation, ping/pong
-lib/kernel.js    Kernel messaging protocol over that socket: execute, collect iopub outputs, interrupt
-lib/notebook.js  The panel's model: cells, outputs, run, and the on-disk mirror
-lib/routes.js    The one authenticated same-origin route the panel talks to
+lib/kernel.js    Kernel messaging protocol over that socket: execute, stream iopub outputs, interrupt
+lib/notebook.js  The panel's model: cells, incremental output rendering, background runs, mirror
+lib/assets.js    Content-addressed image store: one file per unique picture, served immutable
+lib/routes.js    The panel's three authenticated same-origin routes (view/command, stream, assets)
 lib/client.js    Browser half: the right-sidebar tab type and the notebook UI (no build step)
 ```
 
@@ -191,6 +209,27 @@ Design notes worth knowing:
   the next `execute_request` with `status: "aborted"` — the cell never ran. That is reported as
   `aborted` (never as a silent empty success) and retried once, which is safe precisely because
   nothing executed the first time.
+- **A panel run is owned by the model, not by the request.** `POST runCell` answers in milliseconds
+  and the execution continues without an HTTP request attached to it. Output leaves the kernel's
+  iopub channel as it is produced, is coalesced for 60 ms (one frame per message would cost more
+  than the rendering it feeds), and travels to the browser over SSE on
+  `/api/jupyterlab/notebook/stream`. A `cell` event closes the run with the authoritative state.
+  This is also why reloading the page no longer interrupts the cell: previously the abort of the
+  POST was wired all the way to `POST /api/kernels/<id>/interrupt`.
+- **A run's output is rendered twice, on purpose.** Incrementally while it runs, so the panel grows;
+  then once more from the kernel's final output list, so the cell the user keeps — and the mirror on
+  disk — is byte-identical to what a non-streamed run would have produced.
+- **Images are addressed by their content.** `lib/assets.js` hashes the bytes and writes one file
+  per unique picture; the cell keeps `api/jupyterlab/asset?name=<hash>.png` and the route answers
+  with `immutable`. Running the same plot again re-uses the URL, a notebook with ten figures costs
+  ten files instead of a multi-megabyte document, and every click no longer re-serializes the
+  pictures. (The route takes the name in a query parameter because `connection.fetch` matches
+  **exact** pathnames — a path segment would 404.)
+- **`React.memo` needs stable props, so the panel provides them.** Each cell carries a `rev`
+  counter; a view fetched from the host reuses the previous cell object when the `rev` still
+  matches, and every handler is created once and reads current state from a ref. Without that,
+  re-rendering a hundred cells on every poll was the cost the transport work had just removed
+  from the host.
 
 ## Verifying a change
 
@@ -216,8 +255,8 @@ Then:
 ```bash
 node test/e2e.mjs        # protocol and runtime: auth, execute, persistence, timeout, kernel lifecycle
 node test/register.mjs   # mounts the plugin in a real cordis context with the real dsh-tools registry
-node test/notebook.mjs   # the panel's model and its HTTP route, driven with real Request objects
-node test/client.mjs     # the browser bundle: registrations, render paths, click and key handlers
+node test/notebook.mjs   # the panel's model, its three routes, streaming events and the asset store
+node test/client.mjs     # the browser bundle: registrations, render paths, clicks, stream patches
 node test/transport.mjs  # DNS cache, socket reuse, Host header, and the WebSocket frame codec
 
 # The password path (login form, XSRF, cookie session) — run this before trusting a deployment:
@@ -248,12 +287,9 @@ Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PAS
   reimplementation of the notebook surface instead. It supports code cells with add, edit, delete,
   run and reorder — no markdown cells, no completion, no variable inspector, no `.ipynb` import or
   export yet.
-- **A cell's output arrives when the cell finishes.** The panel shows `running…` and then the whole
-  output at once; there is no incremental stream from iopub to the browser yet, so a cell that
-  prints for a minute looks stalled for a minute. The interrupt button stays reachable during a run.
-- **Rich outputs travel inside the notebook JSON.** A cell's images are shipped as base64 data URLs
-  with every full view, which is fine for a handful of plots and wasteful for a wall of them; moving
-  them behind their own route is the next payload win.
+- **A cell's output streams while it runs.** `Run` answers as soon as the kernel has the code, and
+  iopub output is pushed to the panel as it is produced, so a cell that prints for a minute shows
+  its first line after a second. The interrupt button stays reachable throughout.
 - **Configuration has no form.** A packaged profile has no schema-driven settings UI without a
   hand-built client bundle, so the address and credentials come from the profile YAML or a
   `jupyter_connect` call.
