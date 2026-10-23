@@ -164,6 +164,9 @@ function viewOf(cells, extra = {}) {
     sessionId: 's1',
     revision: 3,
     path: null,
+    // A session holds a desk of notebooks; the view always names the page it is showing.
+    notebook: 'main',
+    notebooks: ['main'],
     cells,
     kernel: { id: 'kernel-abcd1234', name: 'python3', state: 'idle' },
     ...extra,
@@ -442,7 +445,7 @@ await check('edit mode renders a textarea holding the draft', () => {
   page.slots.length = 0
   page.slots[0] = viewOf([cellOf()])
   page.slots[4] = 'c1'
-  page.slots[5] = { c1: 'print(2)' }
+  page.slots[5] = { main: { c1: 'print(2)' } }
   const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
   const textareas = findAll(node.type(node.props), 'textarea')
   assert.equal(textareas.length, 1)
@@ -457,7 +460,7 @@ await check('Shift+Enter in the editor runs the cell and suppresses the newline'
   page.slots.length = 0
   page.slots[0] = viewOf([cellOf()])
   page.slots[4] = 'c1'
-  page.slots[5] = { c1: 'print(3)' }
+  page.slots[5] = { main: { c1: 'print(3)' } }
   const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
   let ran = null
   const editing = node.type({ ...node.props, editing: 'c1', draft: 'print(3)', onRun: (id, source) => { ran = { id, source } } })
@@ -969,7 +972,7 @@ await check('a run-all event flips the toolbar without a revision bump', () => {
 
 await check('an unsaved draft is back after a reload, in its editor', () => {
   const storage = installSessionStorage({
-    'dshj:draft:s1': JSON.stringify({ editing: 'c1', drafts: { c1: 'print("half written' } }),
+    'dshj:draft:s1': JSON.stringify({ notebook: 'main', editing: 'c1', drafts: { main: { c1: 'print("half written' } } }),
   })
   const fetchState = installFetch(viewOf([cellOf()], { revision: 92 }))
   try {
@@ -987,7 +990,7 @@ await check('an unsaved draft is back after a reload, in its editor', () => {
 
 await check('a draft for a cell that no longer exists is dropped, not resurrected', async () => {
   const storage = installSessionStorage({
-    'dshj:draft:s1': JSON.stringify({ editing: null, drafts: { gone: 'orphan text' } }),
+    'dshj:draft:s1': JSON.stringify({ notebook: 'main', editing: null, drafts: { main: { gone: 'orphan text' } } }),
   })
   const fetchState = installFetch(viewOf([cellOf({ id: 'c1' })], { revision: 93 }))
   try {
@@ -995,7 +998,122 @@ await check('a draft for a cell that no longer exists is dropped, not resurrecte
     await tick()
     const saved = storage.map.get('dshj:draft:s1')
     // Either removed, or stored without the orphan — never carried into a later session.
-    assert.equal(saved === undefined || !JSON.parse(saved).drafts.gone, true)
+    assert.equal(saved === undefined || JSON.parse(saved).drafts.main === undefined, true)
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
+})
+
+await check('a draft record from before several notebooks existed still opens', () => {
+  // The old shape was one flat map of cell id to text. Losing it on upgrade would lose exactly
+  // the paragraph a draft exists to protect, so it is read as the page it belonged to.
+  const storage = installSessionStorage({
+    'dshj:draft:s1': JSON.stringify({ editing: null, drafts: { c1: 'legacy draft' } }),
+  })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 96 }))
+  try {
+    const tree = panelTree({ sessionId: 's1', t: (key) => key })
+    const node = findComponent(tree, (props) => props.cell?.id === 'c1')
+    assert.equal(node.props.draft, 'legacy draft')
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
+})
+
+console.log('\nseveral notebooks')
+
+/** Render the panel on a view that is already on screen, the way a reloaded page would be. */
+function primedTree(extra = {}) {
+  const view = viewOf([cellOf()], { revision: 99, ...extra })
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = view
+  return page.component('sidebar.right.pane.tab')({ sessionId: 's1', t: (key) => key })
+}
+
+await check('the picker names every notebook and marks the one on screen', () => {
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 94, notebook: 'Untitled', notebooks: ['main', 'Untitled'] }))
+  try {
+    const tree = primedTree({ notebook: 'Untitled', notebooks: ['main', 'Untitled'] })
+    const picker = findAll(tree, 'select').find((node) => node.props.className === 'dshj-picker')
+    assert.ok(picker !== undefined, 'the toolbar must offer a way between pages')
+    assert.equal(picker.props.value, 'Untitled', 'the open notebook is the selected one')
+    assert.deepEqual(picker.props.children.map((option) => option.props.value), ['main', 'Untitled'])
+    assert.equal(picker.props['aria-label'], 'notebookPicker')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('choosing another notebook asks the host to switch, once', async () => {
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 95, notebooks: ['main', 'Untitled'] }))
+  try {
+    const tree = primedTree({ notebooks: ['main', 'Untitled'] })
+    const picker = findAll(tree, 'select').find((node) => node.props.className === 'dshj-picker')
+    await picker.props.onChange({ target: { value: 'Untitled' } })
+    const sent = fetchState.calls.map((call) => call.command).filter((command) => command !== null)
+    assert.equal(sent.length, 1, 'one switch, not one per render')
+    assert.equal(sent[0].action, 'switchNotebook')
+    assert.equal(sent[0].notebook, 'Untitled')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('the new-notebook button asks the host for a page, not for a name', async () => {
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 96 }))
+  try {
+    const tree = primedTree({})
+    const button = byText(tree, 'newNotebook')
+    assert.ok(button !== undefined, 'a session with one notebook still needs a way to start another')
+    assert.equal(button.props.title, 'newNotebookHint')
+    await button.props.onClick()
+    const sent = fetchState.calls.map((call) => call.command).filter((command) => command !== null)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].action, 'newNotebook', 'the host picks the name')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a switch in another window reloads this one instead of patching it', async () => {
+  const source = installEventSource()
+  const fetchState = installFetch(viewOf([cellOf({ id: 'c1', source: 'main_cell = 1' })], { revision: 97 }))
+  try {
+    const props = { sessionId: 's1', t: (key) => key }
+    page.React.reset()
+    page.slots.length = 0
+    page.slots[0] = viewOf([cellOf({ id: 'c1', source: 'main_cell = 1' })], { revision: 97 })
+    page.component('sidebar.right.pane.tab')(props)
+    const before = fetchState.calls.length
+    source.instances[0].emit({ type: 'notebook', notebook: 'Untitled' })
+    // A reload, because the cell list belongs to a document that is no longer on screen.
+    assert.equal(fetchState.calls.length, before + 1)
+    assert.equal(fetchState.calls.at(-1).command, null, 'a read, not a command')
+    // A window that missed the frame still gets there through the poll, so the switch is not lost.
+    assert.equal(fetchState.calls.at(-1).url.includes('since='), false, 'the whole view, not a delta')
+  } finally {
+    fetchState.restore()
+    source.restore()
+  }
+})
+
+await check('drafts survive a switch away from the page they belong to', () => {
+  const storage = installSessionStorage({})
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 98 }))
+  try {
+    const props = { sessionId: 's1', t: (key) => key }
+    page.React.reset()
+    page.slots.length = 0
+    page.slots[0] = viewOf([cellOf()], { revision: 98 })
+    // A draft typed on `main`, then the host's answer to a switch: a different document.
+    page.slots[5] = { main: { c1: 'only in main' } }
+    page.component('sidebar.right.pane.tab')(props)
+    const saved = JSON.parse(storage.map.get('dshj:draft:s1'))
+    assert.deepEqual(saved.drafts, { main: { c1: 'only in main' } }, 'the text is stored per page')
+    assert.equal(saved.notebook, 'main')
   } finally {
     fetchState.restore()
     storage.restore()
@@ -1034,7 +1152,7 @@ await check('edit mode puts the highlight layer under a transparent textarea', (
   page.slots.length = 0
   page.slots[0] = viewOf([cellOf()])
   page.slots[4] = 'c1'
-  page.slots[5] = { c1: 'x = 1' }
+  page.slots[5] = { main: { c1: 'x = 1' } }
   const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
   const rendered = node.type({ ...node.props, editing: 'c1', draft: 'x = 1' })
   const layer = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-hl')
@@ -1286,7 +1404,7 @@ await check('a markdown cell edits as plain text rather than highlighted code', 
   page.slots.length = 0
   page.slots[0] = viewOf([cellOf({ kind: 'markdown', source: '# Title' })])
   page.slots[4] = 'c1'
-  page.slots[5] = { c1: '# Title' }
+  page.slots[5] = { main: { c1: '# Title' } }
   const node = findComponent(notebook({ sessionId: 's1', t: (key) => key }), (props) => props.cell?.id === 'c1')
   const rendered = node.type({ ...node.props, editing: 'c1', draft: '# Title' })
   assert.equal(findAll(rendered, 'pre').filter((node) => node.props.className === 'dshj-hl').length, 0)

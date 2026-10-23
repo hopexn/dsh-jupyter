@@ -200,6 +200,24 @@ await check('a rendered markdown cell is announced without touching the kernel',
   assert.match(note.text, /# Findings/)
 })
 
+await check('a switch says the cell numbers in older notes now point elsewhere', async () => {
+  const [note] = notesOf([{ type: 'switchNotebook', name: 'Untitled', count: 3 }])
+  assert.equal(note.summary, 'Switched to “Untitled”')
+  assert.equal(note.key, 'notebook-switch')
+  assert.match(note.text, /switched the panel to the notebook "Untitled"/)
+  assert.match(note.text, /It holds 3 cell\(s\)/)
+  // The reason the note exists at all: every earlier note numbered cells in another notebook.
+  assert.match(note.text, /read the notebook again before naming a cell by number/)
+})
+
+await check('a new notebook is announced as empty, with the old one still there', async () => {
+  const [note] = notesOf([{ type: 'newNotebook', name: 'Untitled 2' }])
+  assert.equal(note.summary, 'Started “Untitled 2”')
+  assert.equal(note.key, 'notebook-new')
+  assert.match(note.text, /new, empty notebook named "Untitled 2"/)
+  assert.match(note.text, /previous notebook still exists/)
+})
+
 await check('deleting the last cell says the notebook kept an empty one', async () => {
   const [note] = notesOf([{ type: 'delete', index: 0, id: 'cell-a', kind: 'code', source: 'x = 1', replaced: true }])
   assert.match(note.text, /The notebook keeps one empty cell/)

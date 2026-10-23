@@ -9,7 +9,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -443,7 +443,11 @@ await check('edits are mirrored to disk and restored by a fresh model', async ()
 await check('the mirror never carries a stale running status', async () => {
   const file = path.join(directory, `${SESSION}.json`)
   const raw = JSON.parse(readFileSync(file, 'utf8'))
-  for (const cell of raw.cells) assert.equal(cell.status, 'idle')
+  // The mirror holds every notebook plus the active name, so the cells under test are on the page
+  // that was open, not at the top level.
+  const cells = raw.notebooks[raw.active].cells
+  assert.ok(cells.length > 0, 'expected the active notebook to hold cells')
+  for (const cell of cells) assert.equal(cell.status, 'idle')
 })
 
 console.log('\noutput rendering')
@@ -837,6 +841,158 @@ await check('an exported notebook imports back with its sources and outputs', as
   const to = 'round-trip-to'
   const view = await notebooks.command(to, { action: 'importNotebook', document })
   assert.deepEqual(view.cells.map((entry) => [entry.kind, entry.source]), [['code', 'round_trip = True'], ['markdown', 'prose *here*']])
+})
+
+console.log('\nseveral notebooks in one session')
+
+/** A model of its own, so a desk under test is not shared with the checks above. */
+function desk(session) {
+  const model = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  return { model, session }
+}
+
+await check('a new notebook is empty, on screen, and named rather than numbered twice', async () => {
+  const { model, session } = desk('desk-new')
+  try {
+    const first = await model.view(session)
+    assert.equal(first.notebook, 'main')
+    assert.deepEqual(first.notebooks, ['main'])
+    await model.command(session, { action: 'updateCell', id: first.cells[0].id, source: 'main_only = True' })
+    const second = await model.command(session, { action: 'newNotebook' })
+    assert.equal(second.notebook, 'Untitled', 'the panel asks for a notebook, not for a name')
+    assert.deepEqual(second.notebooks, ['main', 'Untitled'])
+    assert.equal(second.cells.length, 1)
+    assert.equal(second.cells[0].source, '', 'a new page starts empty')
+    const third = await model.command(session, { action: 'newNotebook' })
+    assert.equal(third.notebook, 'Untitled 2', 'the same default name twice would be unfindable')
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('switching back finds the page exactly as it was left', async () => {
+  const { model, session } = desk('desk-switch')
+  try {
+    const main = await model.view(session)
+    await model.command(session, { action: 'updateCell', id: main.cells[0].id, source: 'kept = 1' })
+    await model.command(session, { action: 'newNotebook' })
+    const back = await model.command(session, { action: 'switchNotebook', notebook: 'main' })
+    assert.equal(back.notebook, 'main')
+    assert.equal(back.cells[0].source, 'kept = 1')
+    assert.deepEqual(back.notebooks, ['main', 'Untitled'], 'the list is every page, not only the open one')
+    assert.equal(back.cells.some((cell) => cell.source === ''), false)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('a switch leaves the sequence behind instead of running it unseen', async () => {
+  let open
+  const gate = new Promise((resolve) => { open = resolve })
+  const slow = new Notebooks({ directory, execute: () => gate, kernelInfo: async () => undefined })
+  try {
+    const session = 'desk-runall-switch'
+    const main = await slow.view(session)
+    await slow.command(session, { action: 'updateCell', id: main.cells[0].id, source: 'slow()' })
+    await slow.command(session, { action: 'newNotebook' })
+    await slow.command(session, { action: 'switchNotebook', notebook: 'main' })
+    const run = slow.runAll(session)
+    // Let the first cell reach the kernel, then leave the page it is running on.
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(slow.isRunningAll(session), true)
+    const other = await slow.command(session, { action: 'switchNotebook', notebook: 'Untitled' })
+    assert.equal(other.notebook, 'Untitled')
+    assert.equal(other.runningAll, false, 'the stop button belonged to the page that was left')
+    assert.equal(slow.isRunningAll(session), false, 'a second page must not inherit a sequence')
+    open({ status: 'ok', executionCount: 1, durationMs: 1, outputs: [] })
+    assert.equal(await run, true)
+  } finally {
+    slow.dispose()
+  }
+})
+
+await check('a name that is not in the desk is refused instead of starting a stray page', async () => {
+  const { model, session } = desk('desk-unknown')
+  try {
+    await model.view(session)
+    await assert.rejects(() => model.command(session, { action: 'switchNotebook', notebook: 'notes' }), /no notebook named "notes"/)
+    await assert.rejects(() => model.command(session, { action: 'switchNotebook', notebook: '   ' }), /needs a notebook name/)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('the desk stops at the cap instead of growing without bound', async () => {
+  const { model, session } = desk('desk-cap')
+  try {
+    await model.view(session)
+    for (let index = 0; index < 11; index += 1) await model.command(session, { action: 'newNotebook' })
+    const full = await model.view(session)
+    assert.equal(full.notebooks.length, 12)
+    await assert.rejects(() => model.command(session, { action: 'newNotebook' }), /already holds 12 notebooks/)
+    // The refusal leaves the desk alone: the cap is a limit, not a state to recover from.
+    assert.equal((await model.view(session)).notebooks.length, 12)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('a mirror written before several notebooks existed opens as main', async () => {
+  const session = 'desk-legacy-mirror'
+  const cells = [{ id: 'old-1', kind: 'code', source: 'legacy = True', origin: 'user', outputs: [], status: 'idle', executionCount: 3, durationMs: 5, error: null, rev: 2 }]
+  writeFileSync(path.join(directory, `${session}.json`), JSON.stringify({ cells, path: 'old.ipynb', revision: 9 }))
+  const model = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: async () => undefined })
+  try {
+    const view = await model.view(session)
+    assert.equal(view.notebook, 'main')
+    assert.deepEqual(view.notebooks, ['main'])
+    assert.equal(view.cells[0].source, 'legacy = True', 'the old page becomes the first notebook')
+    assert.equal(view.path, 'old.ipynb')
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('every notebook is in the mirror, and the active one is the page on screen', async () => {
+  const { model, session } = desk('desk-mirror')
+  try {
+    const main = await model.view(session)
+    await model.command(session, { action: 'updateCell', id: main.cells[0].id, source: 'in_main = 1' })
+    await model.command(session, { action: 'newNotebook' })
+    await model.command(session, { action: 'addCell', source: 'in_second = 2' })
+    const raw = JSON.parse(readFileSync(path.join(directory, `${session}.json`), 'utf8'))
+    assert.equal(raw.active, 'Untitled')
+    assert.deepEqual(Object.keys(raw.notebooks), ['main', 'Untitled'])
+    assert.equal(raw.notebooks.main.cells[0].source, 'in_main = 1')
+    assert.equal(raw.notebooks.Untitled.cells[1].source, 'in_second = 2')
+    // A fresh model reads both pages back, including the one that is not on screen.
+    const reopened = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: async () => undefined })
+    try {
+      const view = await reopened.view(session)
+      assert.equal(view.notebook, 'Untitled')
+      assert.equal(view.cells[1].source, 'in_second = 2')
+      const back = await reopened.command(session, { action: 'switchNotebook', notebook: 'main' })
+      assert.equal(back.cells[0].source, 'in_main = 1')
+    } finally {
+      reopened.dispose()
+    }
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('the model names the notebook it is looking at', async () => {
+  const { model, session } = desk('desk-outline')
+  try {
+    await model.view(session)
+    await model.command(session, { action: 'newNotebook' })
+    const outline = model.outline(session)
+    assert.match(outline, /The notebook "Untitled"/)
+    const snapshot = model.snapshot(session)
+    assert.equal(snapshot.notebook, 'Untitled')
+  } finally {
+    model.dispose()
+  }
 })
 
 console.log('\nhttp route')
