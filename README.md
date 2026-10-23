@@ -27,13 +27,24 @@ restart re-attaches to the same kernel instead of silently starting an empty one
 The plugin also puts a notebook in the **right sidebar**, beside the conversation:
 
 - **Cells**: `+ Cell` adds one below the last, `✕` deletes, `↑`/`↓` reorder, `⌫` clears one cell's
-  output, and the toolbar's `Clear outputs` empties them all.
+  output, and the toolbar's `Clear outputs` empties them all. The `Py`/`MD` chip in a cell's header
+  switches it between code and markdown; a markdown cell renders instead of running, and never
+  touches the kernel.
 - **Edit**: double-click a cell's source to edit it in place; `Done`, `Escape` or running it commits
-  the change. Clicking `Run` runs the cell as it stands.
+  the change. Clicking `Run` runs the cell as it stands. Code is syntax-highlighted both at rest
+  and while typing: the editor is a transparent textarea over a coloured copy of its own text, so
+  the caret, selection and IME stay native (the layer steps aside while an IME composes).
 - **Run**: `Shift+Enter` in the editor saves and runs — the same gesture as JupyterLab, and one
   request: the cell's draft travels with the run instead of being saved first. Outputs render
-  beneath the cell: stdout, stderr, the value of the last expression, tracebacks, and images
-  (PNG/JPEG/GIF/WebP).
+  beneath the cell: stdout, stderr, the value of the last expression, tracebacks, images
+  (PNG/JPEG/GIF/WebP), markdown, and HTML.
+- **Rich output**: a MIME bundle is rendered by its richest representation the panel can draw.
+  `text/html` — what pandas, polars and Styler emit — mounts as a real table inside a shadow root,
+  so its own CSS applies while it cannot reach the panel; the HTML is stripped of scripts and event
+  handlers first. `text/markdown` renders through the panel's own markdown parser (headings, lists,
+  tables, code fences with highlighting). `text/plain` is the fallback, and anything past 256 KiB
+  of markup falls back to it deliberately.
+
 - **Watched while it runs**: `Run` answers as soon as the kernel has the code, and the output is
   pushed to the panel over a stream as it is produced. A cell that prints for a minute shows its
   first line after a second, and closing or reloading the page does not stop it.
@@ -230,6 +241,20 @@ Design notes worth knowing:
   matches, and every handler is created once and reads current state from a ref. Without that,
   re-rendering a hundred cells on every poll was the cost the transport work had just removed
   from the host.
+- **The highlighter is a tokenizer, not a parser.** There is no build step and no client package,
+  so one regex pass with a deliberate priority — IPython magic at a line start, then comments, then
+  strings, then numbers, names and operators — produces the coloured runs the editor draws. It
+  cannot be wrong about a string that contains a `#`, which is the failure that matters; it does not
+  try to colour f-string expressions or parenthesis depth. The markdown parser follows the same
+  principle: block structure by line, inline spans by one regex, every node built through
+  `createElement` rather than an HTML string.
+- **Kernel HTML is mounted, not injected.** An output is whatever the cell decided to print, so it
+  is parsed with `DOMParser`, stripped of `script`/`iframe`/`object`/`link`/`meta`/`base`/`form`,
+  every `on*` attribute, `srcdoc`, and `javascript:` URLs, then appended to a **shadow root** on its
+  own host element. A shadow root gives the table its natural height and full CSS isolation: pandas'
+  `style scoped` and a Styler's rules apply to it, and neither they nor `body { display: none }`
+  can affect the panel. It is the same trick JupyterLab uses an iframe for, without the iframe's
+  fixed height.
 
 ## Verifying a change
 
@@ -284,9 +309,14 @@ Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PAS
 
 - **The panel is a notebook, not JupyterLab.** JupyterLab sends `Content-Security-Policy:
   frame-ancestors 'self'`, so it cannot be framed in the Harness UI; the panel is a native
-  reimplementation of the notebook surface instead. It supports code cells with add, edit, delete,
-  run and reorder — no markdown cells, no completion, no variable inspector, no `.ipynb` import or
-  export yet.
+  reimplementation of the notebook surface instead. It supports code and markdown cells with add,
+  edit, delete, run, reorder and type switching — no completion, no variable inspector, no `.ipynb`
+  import or export yet.
+- **Output support is a chosen subset.** Images, `text/html`, `text/markdown` and text are rendered;
+  `application/json`, LaTeX and arbitrary MIME types are not (a `display_data` carrying only those
+  names its MIME types instead of drawing them). HTML is sanitized rather than trusted, so an output
+  that relies on its own `<script>` — an interactive widget, a plotly figure — renders its static
+  markup only.
 - **A cell's output streams while it runs.** `Run` answers as soon as the kernel has the code, and
   iopub output is pushed to the panel as it is produced, so a cell that prints for a minute shows
   its first line after a second. The interrupt button stays reachable throughout.
