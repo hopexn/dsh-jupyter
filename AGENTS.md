@@ -41,6 +41,7 @@ lib/dns-cache.js 进程级解析缓存
 lib/websocket.js 最小 RFC 6455 客户端（内核通道）
 lib/kernel.js    内核消息协议、输出归一化、产物落盘
 lib/notebook.js  面板模型：单元格、增量渲染、后台运行、镜像
+lib/activity.js  面板活动 → 模型的上下文：缓冲、note 文案、agent/pre-step 交付
 lib/assets.js    内容寻址图片仓库
 lib/routes.js    三条同源路由 + SSE
 lib/client.js    浏览器半边（工厂字符串，无构建、无 JSX）
@@ -63,9 +64,12 @@ notebook/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器半边
 5. **一次执行一个队列。** iopub 消息没有 request id，所有执行必须经过
    `KernelConnection.#queue`，不要另开并发路径。
 6. **大 payload 不进笔记本 JSON。** 图片走 `AssetStore` 换 URL；视图是每次点击都要重发的。
-7. **测试服务器不要 `disable_check_xsrf`。** 它会把真实的 XSRF 缺陷藏起来——第一轮就是这么
+7. **面板活动只走 `agent/pre-step` 的 notice。** 不要直接往会话 `append` 一条 user/message：
+   一条 note 不该凭空开出一轮对话，交付时机归 agent 决定；来源必须是 `kind:'plugin'`，
+   不能伪装成用户输入。
+8. **测试服务器不要 `disable_check_xsrf`。** 它会把真实的 XSRF 缺陷藏起来——第一轮就是这么
    漏掉 `X-XSRFToken` 的。
-8. **有意不做的事**（别"顺手"补上，先看 `docs/design.md` §10）：`.ipynb` 导入导出、
+9. **有意不做的事**（别"顺手"补上，先看 `docs/design.md` §10）：`.ipynb` 导入导出、
    LaTeX/JSON 输出、虚拟滚动、`jupyter_execute` 流式。
 
 ## 验证
@@ -73,6 +77,7 @@ notebook/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器半边
 ```bash
 node test/transport.mjs   # 传输层，自带 peer，无需 Jupyter
 node test/notebook.mjs    # 面板模型与三条路由
+node test/activity.mjs    # 面板活动 → 模型上下文（note 文案、交付守卫）
 node test/client.mjs      # 浏览器半边（jsdom）
 
 # 需要真服务器（起法见 README「Verifying a change」）
@@ -86,7 +91,7 @@ node test/register.mjs    # 需要 node_modules 链接到 DSH 包
 ln -s <extracted-dsh-packages>/node_modules node_modules
 ```
 
-改动只涉及渲染时，前三套够了；动了协议、认证、生命周期，必须跑 `e2e`。
+改动只涉及渲染或面板行为时，离线四套够了；动了协议、认证、生命周期，必须跑 `e2e`。
 
 ## 提交
 

@@ -403,6 +403,84 @@ await check('an oversized image is summarized instead of embedded', () => {
   assert.match(rendered[0].text, /omitted/)
 })
 
+console.log('\npanel activity')
+
+// A recorder instead of the real buffer: this file is about what the model reports, not about how
+// a note is worded (that is `test/activity.mjs`).
+const events = []
+const watched = new Notebooks({
+  directory,
+  execute: fake.runtime.execute,
+  kernelInfo: fake.runtime.kernelInfo,
+  activity: {
+    record: (sessionId, event) => events.push({ sessionId, event }),
+    pending: (sessionId) => events.filter((entry) => entry.sessionId === sessionId).length,
+  },
+})
+const WATCHED = 'watched-session'
+const lastEvent = () => events[events.length - 1]
+
+await check('editing a cell reports the cell, its position, and both versions', async () => {
+  const first = (await watched.view(WATCHED)).cells[0]
+  await watched.command(WATCHED, { action: 'updateCell', id: first.id, source: 'a = 1' })
+  const entry = lastEvent()
+  assert.equal(entry.sessionId, WATCHED)
+  assert.equal(entry.event.type, 'edit')
+  assert.equal(entry.event.index, 0)
+  assert.equal(entry.event.id, first.id)
+  assert.deepEqual(entry.event.before, { kind: 'code', source: '' })
+  assert.equal(entry.event.source, 'a = 1')
+})
+
+await check('a run reports its start and then its outcome', async () => {
+  const cell = (await watched.view(WATCHED)).cells[0]
+  const before = events.length
+  await watched.command(WATCHED, { action: 'runCell', id: cell.id, source: 'print(2)' })
+  assert.equal(events[before].event.type, 'run-start')
+  assert.match(events[before].event.source, /print\(2\)/)
+  await watched.idle(WATCHED)
+  const end = lastEvent()
+  assert.equal(end.event.type, 'run-end')
+  assert.equal(end.event.execution.status, 'ok')
+  assert.equal(end.event.index, 0)
+  assert.match(end.event.source, /print\(2\)/, 'the note quotes what actually ran')
+})
+
+await check('structural actions are reported in order', async () => {
+  const start = events.length
+  const added = await watched.command(WATCHED, { action: 'addCell' })
+  const addedCell = added.cells[added.cells.length - 1]
+  await watched.command(WATCHED, { action: 'clearOutput', id: addedCell.id })
+  await watched.command(WATCHED, { action: 'clearAllOutputs' })
+  await watched.command(WATCHED, { action: 'deleteCell', id: addedCell.id })
+  await watched.command(WATCHED, { action: 'reset' })
+  assert.deepEqual(
+    events.slice(start).map((entry) => entry.event.type),
+    ['add', 'clear', 'clear-all', 'delete', 'reset'],
+  )
+  assert.ok(lastEvent().event.count >= 1, 'a reset reports how much it discarded')
+})
+
+await check('reordering is not worth a note', async () => {
+  await watched.command(WATCHED, { action: 'addCell' })
+  const cells = (await watched.view(WATCHED)).cells
+  const before = events.length
+  await watched.command(WATCHED, { action: 'moveCell', id: cells[0].id, delta: 1 })
+  assert.equal(events.length, before)
+})
+
+await check('the view counts what is waiting for the model', async () => {
+  const view = await watched.view(WATCHED)
+  assert.ok(view.pendingNotes > 0)
+  assert.equal(watched.pendingNotes(WATCHED), view.pendingNotes)
+})
+
+await check('a notebook with no buffer says nothing about notes', async () => {
+  const view = await notebooks.view(SESSION)
+  assert.equal('pendingNotes' in view, false)
+  assert.equal(notebooks.pendingNotes(SESSION), 0)
+})
+
 console.log('\nhttp route')
 
 const registered = []
@@ -489,6 +567,21 @@ await check('GET without a session id fails cleanly', async () => {
   const body = await (await get('')).json()
   assert.match(body.error, /sessionId is required/)
 })
+await check('a poll that already has the revision gets the short answer', async () => {
+  const view = await (await get(`sessionId=${SESSION}`)).json()
+  const body = await (await get(`sessionId=${SESSION}&since=${view.revision}`)).json()
+  assert.equal(body.unchanged, true)
+  assert.equal(body.revision, view.revision)
+  assert.equal(body.pendingNotes, 0, 'the badge must be correctable without a revision bump')
+  assert.equal(body.cells, undefined, 'the notebook must not be re-sent')
+  assert.equal(body.configured, true, 'connection info still rides along')
+})
+await check('a stale revision still gets the whole view', async () => {
+  const view = await (await get(`sessionId=${SESSION}`)).json()
+  const body = await (await get(`sessionId=${SESSION}&since=${view.revision - 1}`)).json()
+  assert.equal(body.unchanged, undefined)
+  assert.ok(Array.isArray(body.cells))
+})
 await check('POST applies a command and returns the new view', async () => {
   const before = (await (await get(`sessionId=${SESSION}`)).json()).cells.length
   const body = await (await post({ sessionId: SESSION, action: 'addCell' })).json()
@@ -552,6 +645,7 @@ await check('the stream route pushes a running cell\'s output as it arrives', as
   assert.match(text, /first\\nsecond\\n/, 'the final cell carries the coalesced stream')
 })
 
+watched.dispose()
 notebooks.dispose()
 rmSync(directory, { recursive: true, force: true })
 

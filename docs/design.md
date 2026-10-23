@@ -20,6 +20,7 @@
 | 执行协议（execute_request / iopub / 中断） | §2.2 | `lib/kernel.js`: `KernelConnection.execute` `#runOne` | `test/e2e.mjs` |
 | 出站 HTTP / DNS / WebSocket | §5.1 | `lib/transport.js` `lib/dns-cache.js` `lib/websocket.js` | `test/transport.mjs` |
 | 面板命令与视图字段 | §3.2 §4.1 | `lib/notebook.js`: `Notebooks.command` `Notebooks.view` | `test/notebook.mjs` |
+| 面板改动如何告知模型 | §2.3 | `lib/activity.js`: `NotebookActivity` `messageForNotes` `registerContextInjection` | `test/activity.mjs` |
 | 面板新增路由 / 改协议 | §4.2 | `lib/routes.js`: `registerNotebookRoutes` | `test/notebook.mjs` |
 | MIME 优先级、输出预算 | §4.3 | `lib/notebook.js`: `OutputRenderer.#bundle` `renderableOutputs` | `test/notebook.mjs` |
 | 代码高亮、Markdown 解析 | §4.4 | `lib/client.js`: `tokenizePython` `Markdown` | `test/client.mjs` |
@@ -109,6 +110,27 @@ client onRun ─ POST {action:'runCell', id, source}
 - **串行化在 `KernelConnection.#queue`。** iopub 消息里没有 request id，同一内核并发执行会串台；
   面板和工具共用这个队列，谁的先到谁先跑。
 
+### 2.3 第三条链路：面板 → 模型（上下文注入）
+
+```
+用户编辑 / 运行 / 删除 / 清空
+  └─ Notebooks 发结构化 activity 事件（只描述发生了什么，不写文案）
+       └─ NotebookActivity 缓冲成 note（按 key 收敛，run-start 被 run-end 替换）
+            └─ agent/pre-step：drain → 一条 user 消息（source: plugin / form: notice）
+                 └─ 会话日志 → 下一次模型请求 + transcript 里一行折叠的上下文
+```
+
+- **只在下一步交付。** 编辑不是一轮对话的开始：`pre-step` 里 `step === 1` 且
+  `decision.messages` 为空时直接跳过，note 留在缓冲里等下一轮；被拒或被取消的 step 也不消费。
+- **来源是插件，不是用户。** `source: {kind:'plugin', plugin:'jupyterlab', form:'notice'}`，
+  模型和界面都不会把它当成用户说的话——这是一条"刚才发生了什么"的上下文，不是指令。
+- **按 key 收敛。** 同一格的 `run-start` 被 `run-end` 覆盖（只留结果），`reset` 会清空所有待发
+  note，因为它描述的单元格已经不存在；`moveCell`、`setPath` 不产生 note。
+- **预算。** 每会话最多 8 条 / 6000 字符；单条源码 900 字符、输出 800 字符；超了丢最旧的，
+  单条超长在消息里截断。
+- **不写会话日志。** 这里不直接 `session.append`：交付时机和"这一轮到底发不发"由 `agent` 决定，
+  绕过它会让一条 note 凭空开出一轮对话。
+
 ---
 
 ## 3. 状态模型
@@ -146,8 +168,9 @@ client onRun ─ POST {action:'runCell', id, source}
   客户端才需要换掉那个单元格对象，`React.memo` 才拦得住兄弟节点。
 
 **视图是浅拷贝。** `view()` 对每个 cell 做 `{...cell}` 而不是深拷贝：路由紧接着 JSON 序列化，
-深拷贝只会把 base64 图再复制一遍。`?since=<revision>` 命中时直接返回
-`{sessionId, revision, unchanged: true}`，两个字段，不碰 Jupyter。
+深拷贝只会把 base64 图再复制一遍。`view()` 只在有待发 note 时带 `pendingNotes`（头部徽标用的
+计数）；`?since=<revision>` 命中时返回 `{sessionId, revision, unchanged: true, pendingNotes}`，
+不碰 Jupyter——note 被取走后 revision 不变，徽标只能靠这个字段归零。
 
 **落盘。** `isHeavy()` 只看长度不序列化；轻的立即写，重的延迟 60 ms 合并写；跑之前和
 `dispose()` 强制落盘。写文件是 `tmp + rename`，紧凑 JSON（缩进对大 payload 是纯浪费）。
@@ -249,6 +272,9 @@ dataUrl}`），客户端两种都认。
 组件树：`Notebook`（拉视图、开流、轮询、发命令）→ `Cell`（memo，读/编辑两态）→ `Output` →
 `HtmlOutput` / `Markdown`。`OpenButton` 是 composer 工具行里的入口，`NotebookTitle` 是侧栏标题。
 
+`pendingNotes` 是唯一一个不随 `revision` 变的视图字段：头部徽标读它，轮询的 `unchanged` 答案
+也带它（见 §3.2）。徽标只在大于 0 时出现，否则工具栏会一直多一个空壳。
+
 三条与性能有关的约定，改 UI 时要保住：
 
 1. **`Cell` 的 props 必须稳定**：未变的 cell 对象（靠 `rev` 复用）、`useCallback` 包过的 handler、
@@ -339,6 +365,7 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | `lib/websocket.js` | RFC 6455 客户端（够用即可） | `KernelSocket` |
 | `lib/kernel.js` | 内核消息协议、输出归一化、产物落盘 | `KernelConnection` `summarizeOutputs` `collectArtifacts` |
 | `lib/notebook.js` | 面板模型：单元格、增量渲染、后台运行、镜像 | `Notebooks` `OutputRenderer` `renderableOutputs` |
+| `lib/activity.js` | 面板活动的缓冲与交付：note 文案、批量消息、`agent/pre-step` 钩子 | `NotebookActivity` `messageForNotes` `registerContextInjection` |
 | `lib/assets.js` | 内容寻址图片仓库 | `AssetStore` `assetUrl` |
 | `lib/routes.js` | 三条同源路由 + SSE | `registerNotebookRoutes` `*_ROUTE` |
 | `lib/client.js` | 浏览器半边：侧栏页签与笔记本 UI | `TYPE_ID` `KIND`（其余在工厂内） |
@@ -351,6 +378,7 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | --- | --- | --- |
 | `test/transport.mjs` | DNS 缓存、连接复用、`Host`、帧编解码 | 否（自带 peer） |
 | `test/notebook.mjs` | 命令、视图、增量渲染、SSE、资源路由、镜像 | 否（注入假 execute） |
+| `test/activity.mjs` | note 文案、批量消息、`agent/pre-step` 的交付与守卫 | 否（假 agent 与假 ctx） |
 | `test/client.mjs` | 注册、渲染路径、点击、流式补丁、memo 身份 | 否（jsdom） |
 | `test/e2e.mjs` | 认证、执行、持久化、超时、内核生命周期 | **是** |
 | `test/register.mjs` | 真 cordis 上下文 + 真 tools 注册表 | 部分（挂载即可） |
@@ -367,6 +395,8 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 - 输出只画图片、`text/html`、`text/markdown`、纯文本；`application/json`、LaTeX 只报 MIME 名。
 - HTML 输出经清洗，所以依赖自身 `<script>` 的东西（交互 widget、plotly）只画静态部分。
 - `jupyter_execute` 不流式：模型一次拿全结果更省轮次；长任务的进度看面板。
+- 面板活动是**下一步的上下文**，不是即时消息：agent 空闲时编辑只会让徽标加一，真正交付发生在
+  下一次请求；已经在飞的请求不会被改写。
 - 一个大内核一个会话绑定；跨会话共享内核属于能力扩展，不在当前范围。
 - 虚拟滚动没做：`memo` 之后每帧只重渲染一格，收益不足以引入行高测量与滚动同步。
 

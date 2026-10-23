@@ -48,6 +48,11 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
 - **Watched while it runs**: `Run` answers as soon as the kernel has the code, and the output is
   pushed to the panel over a stream as it is produced. A cell that prints for a minute shows its
   first line after a second, and closing or reloading the page does not stop it.
+- **Told to the agent**: an edit, a run (with its outcome and the tail of what it printed), a
+  deletion, a cleared output — each is queued for the model and delivered with its next step as a
+  context note attributed to this plugin, not as something the user typed. The header shows how
+  many notes are waiting (`2 queued`). A run's start is replaced by its result, so the model sees
+  one accurate note per cell rather than a stream of them.
 - **Live**: while the panel is visible it also polls the host, carrying the revision it already has,
   so a cell the agent ran in the shared kernel appears without a click. When nothing changed the
   answer is two fields and never reaches Jupyter.
@@ -170,6 +175,7 @@ lib/dns-cache.js Process-wide name-resolution cache, plugged into http and the k
 lib/websocket.js Minimal RFC 6455 client for the kernel channel: masking, fragmentation, ping/pong
 lib/kernel.js    Kernel messaging protocol over that socket: execute, stream iopub outputs, interrupt
 lib/notebook.js  The panel's model: cells, incremental output rendering, background runs, mirror
+lib/activity.js  What the user did in the panel, buffered and handed to the model at its next step
 lib/assets.js    Content-addressed image store: one file per unique picture, served immutable
 lib/routes.js    The panel's three authenticated same-origin routes (view/command, stream, assets)
 lib/client.js    Browser half: the right-sidebar tab type and the notebook UI (no build step)
@@ -230,6 +236,16 @@ Design notes worth knowing:
 - **A run's output is rendered twice, on purpose.** Incrementally while it runs, so the panel grows;
   then once more from the kernel's final output list, so the cell the user keeps — and the mirror on
   disk — is byte-identical to what a non-streamed run would have produced.
+- **Panel activity reaches the model as context, not as a chat message.** The user edits and runs
+  cells in the very kernel the agent uses, so without a note the agent's next request describes a
+  notebook that no longer exists — a variable redefined, an output cleared, a cell deleted. Notes
+  are buffered per session and appended to the step's messages in `agent/pre-step`, the same
+  waterfall `time-context` and `agent-instructions` use, with
+  `source: { kind: 'plugin', plugin: 'jupyterlab', form: 'notice' }`; the transcript shows them as
+  a collapsed context row instead of user speech. Two guards matter: a rejected or aborted step
+  keeps its notes, and a first step with no message is never turned into a model call by a note —
+  an edit is context for a conversation, not a reason to start one. A run's start and end share
+  one key, so only the outcome survives.
 - **Images are addressed by their content.** `lib/assets.js` hashes the bytes and writes one file
   per unique picture; the cell keeps `api/jupyterlab/asset?name=<hash>.png` and the route answers
   with `immutable`. Running the same plot again re-uses the URL, a notebook with ten figures costs
@@ -291,6 +307,7 @@ Then:
 node test/e2e.mjs        # protocol and runtime: auth, execute, persistence, timeout, kernel lifecycle
 node test/register.mjs   # mounts the plugin in a real cordis context with the real dsh-tools registry
 node test/notebook.mjs   # the panel's model, its three routes, streaming events and the asset store
+node test/activity.mjs   # activity notes: wording, batching, and the agent/pre-step delivery guards
 node test/client.mjs     # the browser bundle: registrations, render paths, clicks, stream patches
 node test/transport.mjs  # DNS cache, socket reuse, Host header, and the WebSocket frame codec
 
@@ -330,6 +347,10 @@ Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PAS
 - **A cell's output streams while it runs.** `Run` answers as soon as the kernel has the code, and
   iopub output is pushed to the panel as it is produced, so a cell that prints for a minute shows
   its first line after a second. The interrupt button stays reachable throughout.
+- **Panel notes arrive at the next step.** A queued note is context for the next model request, not
+  a message sent on the user's behalf: editing a cell while the agent is idle updates the badge and
+  sends nothing until the conversation continues. Nothing is injected into a request already in
+  flight.
 - **Configuration has no form.** A packaged profile has no schema-driven settings UI without a
   hand-built client bundle, so the address and credentials come from the profile YAML or a
   `jupyter_connect` call.

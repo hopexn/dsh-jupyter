@@ -622,6 +622,27 @@ await check('a poll that changed nothing keeps the cell objects, so memo can ski
   }
 })
 
+await check('the header shows how many panel changes are waiting for the agent', () => {
+  const Notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cellOf()], { pendingNotes: 2 })
+  const tree = Notebook({ sessionId: 's-badge', t: (key) => key })
+  const badge = flatten(tree).find((node) => node.props?.className === 'dshj-sync')
+  assert.ok(badge !== undefined, 'a queued count must be visible')
+  assert.equal(textOf(badge), '2 syncLabel')
+  assert.equal(badge.props.title, 'syncHint')
+})
+
+await check('the badge disappears when nothing is queued', () => {
+  const Notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cellOf()], { pendingNotes: 0 })
+  const tree = Notebook({ sessionId: 's-badge', t: (key) => key })
+  assert.equal(flatten(tree).find((node) => node.props?.className === 'dshj-sync'), undefined)
+})
+
 console.log('\nhighlighting')
 
 await check('code is highlighted without changing its text', () => {
