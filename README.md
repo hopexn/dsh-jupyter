@@ -54,7 +54,12 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
   at the end of the notebook.
 - **Unsaved edits survive a reload**: text you typed but have not committed is parked in the tab's
   `sessionStorage`, so an accidental F5 brings the editor back with the text in it. It never leaves
-  the browser — a draft is not a command.
+  the browser — a draft is not a command. Drafts are kept per notebook, so switching pages to check
+  something and coming back finds the paragraph still there.
+- **Several notebooks per session**: the picker in the header switches between them, `+ New` starts
+  another (up to twelve, named by the host). Each page has its own cells, outputs and export; they
+  share the session's kernel, so a variable defined on one page is still there on the next. `Run
+  all` stops when you leave the page it was running on — an invisible stop button is no stop button.
 - **Long outputs fold**: past 24 lines (or 4 000 characters, or 2 000 for HTML) an output starts
   collapsed with a `Show more` toggle, so one log-heavy cell cannot push the rest off the screen.
 - **Rich output**: a MIME bundle is rendered by its richest representation the panel can draw.
@@ -94,7 +99,8 @@ visible to `jupyter_execute` and vice versa, in both directions and immediately 
 separate "notebook kernel". Concurrency is handled by the same per-kernel queue, so a cell you run
 while the agent is executing simply waits its turn. The agent can also read and edit the cells you
 wrote with `jupyter_notebook`, which is what makes "fix cell 3" a request it can act on instead of
-guess at.
+guess at. A session can hold several notebooks; every reply from the tool names the one in the
+panel, and switching pages tells the model that earlier cell numbers no longer point where they did.
 
 Cells are mirrored to `$DSH_HOME/jupyterlab/notebooks/<session>.json`, so a page reload or an app
 restart restores them.
@@ -290,6 +296,12 @@ Design notes worth knowing:
   matches, and every handler is created once and reads current state from a ref. Without that,
   re-rendering a hundred cells on every poll was the cost the transport work had just removed
   from the host.
+- **A session holds a desk of notebooks, mirrored as one file.** `{active, notebooks}` is written
+  atomically because a crash between two files could reopen the wrong page; a mirror from before
+  multi-notebook became `main` on load, so an upgrade never loses the only page there was. Switching
+  pages is broadcast on the stream as its own event and makes the client re-read the whole view: a
+  different document cannot be expressed as a patch to the cell list. It also drops the revision
+  guard, because revisions are only comparable within one notebook.
 - **The highlighter is a tokenizer, not a parser.** There is no build step and no client package,
   so one regex pass with a deliberate priority — IPython magic at a line start, then comments, then
   strings, then numbers, names and operators — produces the coloured runs the editor draws. It
@@ -378,6 +390,10 @@ Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PAS
   reimplementation of the notebook surface instead. It supports code and markdown cells with add,
   edit, delete, insert, run, run-all, reorder and type switching — no completion, no variable
   inspector, no debugger.
+- **Several notebooks can be open, but not managed.** A session can hold up to twelve, each with its
+  own cells and export; none can be renamed, closed or deleted, and switching pages keeps the same
+  kernel — so variables and imports carry across, and there is no per-notebook kernel binding.
+  Export writes the page you are looking at.
 - **`.ipynb` import and export are lossy.** Reading and writing notebook files works, but the panel
   holds a subset of the format: raw cells are imported as markdown, output types it cannot draw and
   images over 2 MiB are dropped, `text/html` over 256 KiB becomes plain text, and a document is

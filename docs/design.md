@@ -26,6 +26,7 @@
 | `.ipynb` 导入导出 | §4.7 | `lib/ipynb.js`: `notebookToIpynb` `ipynbToCells`；`lib/routes.js`: `DOWNLOAD_ROUTE` | `test/ipynb.mjs` `test/notebook.mjs` |
 | 全部运行 / 停止 | §2.2 | `lib/notebook.js`: `runAll` `stopRunAll` `isRunningAll` | `test/notebook.mjs` |
 | 未保存的草稿、折叠长输出 | §4.6 | `lib/client.js`: `readDrafts` `writeDrafts` `Collapsible` | `test/client.mjs` |
+| 一个会话里的多本笔记本 | §3.2 §4.1 | `lib/notebook.js`: `#desk` `newNotebook` `switchNotebook`；`lib/client.js`: `dshj-picker` `draftsFor` | `test/notebook.mjs` `test/client.mjs` `test/activity.mjs` |
 | 面板改动如何告知模型 | §2.3 | `lib/activity.js`: `NotebookActivity` `messageForNotes` `registerContextInjection` | `test/activity.mjs` |
 | 面板新增路由 / 改协议 | §4.2 | `lib/routes.js`: `registerNotebookRoutes` | `test/notebook.mjs` |
 | MIME 优先级、输出预算 | §4.3 | `lib/notebook.js`: `OutputRenderer.#bundle` `renderableOutputs` | `test/notebook.mjs` |
@@ -190,11 +191,25 @@ jupyter_execute
 
 | 私有字段 | 内容 | 生命周期 |
 | --- | --- | --- |
-| `#notebooks` | 会话 → `{cells, path, revision}` | 首次访问时从镜像加载 |
+| `#notebooks` | 会话 → `{active, docs: Map<名字, {name, cells, path, revision}>}`（下称"书桌"） | 首次访问时从镜像加载 |
 | `#pendingPersistence` | 会话 → 延迟写盘的 timer | 大笔记本 60 ms 合并写 |
 | `#listeners` | 会话 → SSE 订阅者集合 | 流断开即移除 |
 | `#runs` | 会话 → 在飞的 Promise 集合 | `idle()` / `dispose()` 等它 |
-| `#runningAll` | 会话 → `{stop}` | 全量运行的停止标志；`dispose()` 会把它们全部置位 |
+| `#runningAll` | 会话 → `{stop, notebook}` | 全量运行的停止标志；`dispose()` 会把它们全部置位 |
+
+**一个会话是一个书桌，不是一本笔记本。** 面板顶部可以换页、也可以新开一页：每页有自己的
+`cells / path / revision`，共用同一个内核（内核按会话绑定，见 §3.1）。`#notebook(session)` 返回
+`active` 那一页，命令和 `view()` 都只作用于它；`#peek(session)` 是同一个东西但不创建会话，
+留给只读路径（`snapshot` `outline` `notebookPath`）。
+
+- **上限 12 本**（`MAX_NOTEBOOKS`）。每一本都是镜像文件里的一个文档，无上限地开会把这个文件
+  撑成没人找得回来的垃圾场。到顶时命令直接报错，不静默丢一页。
+- **名字由宿主起**，`uniqueName()` 只负责不重名（`Untitled`、`Untitled 2`……）：面板从不让
+  用户输入名字，反问一个没有信息量的名字只是多一步操作。
+- **换页会停掉全量运行。** 序列属于它开始的那一页，看不见的停止按钮等于没有停止按钮。
+- **镜像是一个文件装全部**：`{active, notebooks: {名字: {cells, path, revision}}, updatedAt}`。
+  `active` 必须和文档一起原子写，否则崩在两次写之间会打开错的那一页。
+- **旧镜像（`{cells, path, revision}`）读成 `main`**：升级不该丢掉用户唯一的那一页。
 
 单元格结构（`CellView`）：`id` `kind` `source` `previousSource` `rev` `status` `executionCount`
 `durationMs` `outputs` `error`。
@@ -229,6 +244,7 @@ jupyter_execute
 | `cell` | `revision` + 完整 cell | 开始/结束的权威状态；不合并，立即下发 |
 | `replace` | `revision` + 完整 cells 列表 | 导入 `.ipynb`：整本换掉，一帧而不是一格一帧 |
 | `runall` | `running` + `revision` | 全量运行开始/结束；不改格子，也不改 revision |
+| `notebook` | `notebook`（新页名字） | 换页/新开：换了文档，客户端重读整份视图而不是给列表打补丁 |
 | `append` | `cellId` + 一条 output | 新增输出（text/html/markdown/image/error） |
 | `text` | `cellId` + `index` + `text` | 向第 index 条输出追加文本 |
 | `clear` | `cellId` | 内核 `clear_output` |
@@ -252,6 +268,8 @@ jupyter_execute
 | `moveCell` | 与相邻格交换（`delta: ±1`） | 越界静默 |
 | `clearOutput` | 清一个格子的输出 | |
 | `clearAllOutputs` | 清全部 | |
+| `newNotebook` | 新开一页并切过去 | 名字由 `uniqueName()` 起；到 `MAX_NOTEBOOKS` 报错；会停全量运行 |
+| `switchNotebook` | 切到 `notebook` 指定的那一页 | 名字不存在就报错，不新建；会停全量运行 |
 | `runCell` | 保存草稿并执行（markdown 直接渲染） | 立即返回，输出走 SSE |
 | `runAll` | 顺序执行所有非空 code 格 | 立即返回；`stopOnError` 可选；停止靠 `interrupt` 或 `stopRunAll` |
 | `importNotebook` | 用 `.ipynb` 的 JSON 替换（`mode:'append'` 则追加） | 整本一个 `replace` 事件；无法保留的内容放进 `message` |
@@ -348,8 +366,13 @@ dataUrl}`），客户端两种都认。
 `notes` 的 summary 并可以丢弃——用户有权知道模型到底会看到什么。
 
 `adopt(next)` 会拒绝比 `panelRevisions` 更旧的完整视图：GET 和 SSE 走两条连接，慢 GET 可能
-在更新的流事件之后到达，否则会把面板倒回去。`origin: 'agent'` 的格子只在头部多一个 `Agent`
-徽标，其余行为与用户格子完全一致。
+在更新的流事件之后到达，否则会把面板倒回去。**换页是这条规则的唯一例外**：另一页的 revision
+可以比当前页小，`adopt` 认出 `next.notebook` 变了就丢掉记录、整份替换——比大小只在同一份文档
+里有意义。`origin: 'agent'` 的格子只在头部多一个 `Agent` 徽标，其余行为与用户格子完全一致。
+
+**换页不是打补丁。** 拿到 `notebook` 事件时客户端重读整份视图（一条 GET），而不是把事件里的
+名字套到现有列表上：那是另一份文档的格子，任何增量事件都表达不了。同一个标签页自己换页时
+命令已经返回了新视图，这里的重读是幂等的；另一个窗口换页时，这是它唯一的知情方式。
 
 三条与性能有关的约定，改 UI 时要保住：
 
@@ -362,11 +385,16 @@ dataUrl}`），客户端两种都认。
 
 草稿与折叠是两块纯客户端状态，宿主完全不知道它们存在：
 
-- **草稿存在 `sessionStorage`（`dshj:draft:<session>`）**，存的是 `{editing, drafts}`。草稿刻意
+- **草稿存在 `sessionStorage`（`dshj:draft:<session>`）**，存的是 `{notebook, editing, drafts}`，
+  其中 `drafts` 按页分层（`{<notebook>: {<cellId>: 文本}}`）。草稿刻意
   不是命令——宿主从没见过用户打的字——所以只有浏览器自己能把它救回来，一次 F5 曾经能吞掉
   写了一半的段落。用 `sessionStorage` 而不是 `localStorage`：草稿属于这个标签页，随标签页消失；
   写回只在**视图到达之后**发生，否则首帧会用空状态把刚读出来的草稿抹掉。草稿在两种情况下失效：
-  格子被删了，或宿主里的源码已经等于它（那说明别人保存了）。
+  格子被删了，或宿主里的源码已经等于它（那说明别人保存了）。**只清理当前这一页**：另一页的格子
+  不在这里，拿它对账等于把人家写了一半的段落删掉。旧的平铺记录（`{editing, drafts: {id: 文本}}`）
+  读成 `main` 的草稿——升级不该丢掉唯一那段没保存的文字。
+- **换页在工具栏上，只有一个控件。** `dshj-picker` 列出 `view.notebooks`，选中的是 `view.notebook`；
+  `+ 新建` 发 `newNotebook` 并让宿主起名字。笔记本的名字只在这里出现，别处再显示一遍就是重复。
 - **长输出默认折叠**：纯文本超过 24 行或 4000 字符、HTML 超过 2000 字符时加一层
   `Collapsible`（`data-open` + 一行渐变），展开状态留在组件本地。`useState` 在早退分支之前
   调用，所以输出在运行中越过阈值时组件不会重挂、已展开的不会被折回去。
@@ -558,7 +586,10 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 - 全量运行只保证"顺序执行现有的非空 code 格"：中途新增的格子不补跑，正在跑的那格不会被
   单独取消（停止是"跑完这格",中断是"杀掉这格"两个动作）。
 - 草稿存在标签页里（`sessionStorage`）：换标签页、换设备都看不到，这是有意的——它是打字中的
-  东西，不是文档。
+  东西，不是文档。草稿按笔记本分开存，所以换页不丢草稿。
+- **多本笔记本只做到"开着"**：不能重命名、不能关闭、不能删页，也没有"每本绑不同内核"。
+  换页之后内核还是同一个，变量与导入都还在——这是共享内核的直接结果，不是遗漏（§3.1）。
+  导出只导当前这一页；非 `main` 的页用名字当下载文件名。
 - 输出只画图片、`text/html`、`text/markdown`、纯文本；`application/json`、LaTeX 只报 MIME 名。
 - HTML 输出经清洗，所以依赖自身 `<script>` 的东西（交互 widget、plotly）只画静态部分。
 - `jupyter_execute` 不流式：模型一次拿全结果更省轮次；长任务的进度看面板。

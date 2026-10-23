@@ -82,6 +82,10 @@ notebook/ipynb/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器
 12. **模型改写单元格必须带 `origin: 'agent'`。** 宿主靠它把旧源码留在 `previousSource`，面板才有
     diff 与撤销；丢掉这个字段，`jupyter_notebook update` 就变成悄悄换掉用户代码。客户端也不能把
     撤销拼成"再发一次 `updateCell`"——那是又一次模型改写，`revertCell` 才是撤销。
+13. **命令都作用于当前那一页。** 一个会话是一个书桌（`#desk`）而不是一本笔记本：`#notebook()`
+    返回 `active` 那一页，`#peek()` 给只读路径用且不创建会话。换页/新开必须发 `notebook` 事件
+    （客户端要重读整份视图，补丁表达不了"换了文档"），并且 `stopRunAll`——看不见的停止按钮等于
+    没有停止按钮。镜像里 `active` 必须和文档一起原子写；旧的平铺镜像要能读成 `main`。
 
 ## 验证
 
