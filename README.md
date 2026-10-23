@@ -28,13 +28,20 @@ restart re-attaches to the same kernel instead of silently starting an empty one
 The plugin also puts a notebook in the **right sidebar**, beside the conversation:
 
 - **Cells**: `+ Cell` adds one below the last, `✕` deletes, `↑`/`↓` reorder, `⌫` clears one cell's
-  output, and the toolbar's `Clear outputs` empties them all. The `Py`/`MD` chip in a cell's header
-  switches it between code and markdown; a markdown cell renders instead of running, and never
-  touches the kernel.
+  output, and the toolbar's `Clear outputs` empties them all. The chip in a cell's header switches
+  it between code and markdown; it names the language the panel draws (`Py`, `R`, `Jl`, or `<>` for
+  a kernel it has no tokenizer for). A markdown cell renders instead of running, and never touches
+  the kernel.
 - **Edit**: double-click a cell's source to edit it in place; `Done`, `Escape` or running it commits
   the change. Clicking `Run` runs the cell as it stands. Code is syntax-highlighted both at rest
-  and while typing: the editor is a transparent textarea over a coloured copy of its own text, so
-  the caret, selection and IME stay native (the layer steps aside while an IME composes).
+  and while typing — in the kernel's own language, taken from the kernelspec, so an R cell is not
+  coloured with Python's keywords and an unknown kernel is shown as plain text rather than guessed
+  at. The editor is a transparent textarea over a coloured copy of its own text, so the caret,
+  selection and IME stay native (the layer steps aside while an IME composes).
+- **Keyboard**: `Shift+Enter` runs and leaves, `Ctrl/Cmd+Enter` runs in place with the editor still
+  open, `Ctrl/Cmd+S` saves without running, `Tab`/`Shift+Tab` indent and outdent (a selection is
+  indented line by line), `Enter` carries the current indentation and adds a level after `:` or `{`,
+  and `Escape` leaves without saving. Keys pressed mid-IME belong to the IME.
 - **Run**: `Shift+Enter` in the editor saves and runs — the same gesture as JupyterLab, and one
   request: the cell's draft travels with the run instead of being saved first. Outputs render
   beneath the cell: stdout, stderr, the value of the last expression, tracebacks, images
@@ -283,9 +290,11 @@ Design notes worth knowing:
   so one regex pass with a deliberate priority — IPython magic at a line start, then comments, then
   strings, then numbers, names and operators — produces the coloured runs the editor draws. It
   cannot be wrong about a string that contains a `#`, which is the failure that matters; it does not
-  try to colour f-string expressions or parenthesis depth. The markdown parser follows the same
-  principle: block structure by line, inline spans by one regex, every node built through
-  `createElement` rather than an HTML string.
+  try to colour f-string expressions or parenthesis depth. The language comes from the kernelspec,
+  not from the notebook: Python, R and Julia each get their own keyword set and their own regex,
+  and a kernel outside those three is rendered as plain text — colouring it with Python's grammar
+  would teach a wrong one. The markdown parser follows the same principle: block structure by line,
+  inline spans by one regex, every node built through `createElement` rather than an HTML string.
 - **Kernel HTML is mounted, not injected.** An output is whatever the cell decided to print, so it
   is parsed with `DOMParser`, stripped of `script`/`iframe`/`object`/`link`/`meta`/`base`/`form`,
   every `on*` attribute, `srcdoc`, and `javascript:` URLs, then appended to a **shadow root** on its

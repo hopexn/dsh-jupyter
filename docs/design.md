@@ -28,7 +28,8 @@
 | 面板改动如何告知模型 | §2.3 | `lib/activity.js`: `NotebookActivity` `messageForNotes` `registerContextInjection` | `test/activity.mjs` |
 | 面板新增路由 / 改协议 | §4.2 | `lib/routes.js`: `registerNotebookRoutes` | `test/notebook.mjs` |
 | MIME 优先级、输出预算 | §4.3 | `lib/notebook.js`: `OutputRenderer.#bundle` `renderableOutputs` | `test/notebook.mjs` |
-| 代码高亮、Markdown 解析 | §4.4 | `lib/client.js`: `tokenizePython` `Markdown` | `test/client.mjs` |
+| 代码高亮、Markdown 解析 | §4.4 | `lib/client.js`: `tokenize` `LANGUAGES` `languageFor` `Markdown` | `test/client.mjs` |
+| 编辑器键盘、焦点与无障碍 | §4.4 §4.6 | `lib/client.js`: `Cell.onKeyDown` `edit` `pendingCaret` | `test/client.mjs` |
 | 图片落盘与缓存 | §4.5 | `lib/assets.js`: `AssetStore` `assetUrl` | `test/notebook.mjs` |
 | 面板 UI、交互、主题 | §4.6 | `lib/client.js`: `Notebook` `Cell` `Output` `CSS` | `test/client.mjs` |
 | 样式/文案（中英） | §4.6 | `lib/client.js`: `en` `zh`；`locale/*.json` | `test/client.mjs` |
@@ -296,15 +297,30 @@ HTML 的两个决定：
 
 ### 4.4 高亮与 Markdown
 
-- **高亮是分词器，不是解析器**（`tokenizePython`）。一次全局正则，分组按优先级：
-  行首 magic（`%`/`!`）→ 注释 → 字符串（含三引号、前缀）→ 装饰器 → 数字 → 标识符 → 运算符。
-  它不会把字符串里的 `#` 当注释，这是唯一真正要紧的正确性；不处理 f-string 内部表达式、
-  不处理括号深度。关键词与内置名靠 `PY_KEYWORDS` / `PY_BUILTINS` 两个 Set 二次判定。
+- **高亮是分词器，不是解析器**（`tokenize(source, language)`）。一次全局正则，分组按优先级：
+  注释 → 字符串 → 数字 → 标识符 → 运算符（Python 还有行首 magic 与装饰器）。它不会把字符串里的
+  `#` 当注释，这是唯一真正要紧的正确性；不处理 f-string 内部表达式、不处理括号深度。
+- **语言来自内核，不来自笔记本。** `languageFor(kernel)` 把 kernelspec 名映射到
+  `LANGUAGES` 里的四项：`python3`/`ipython` → Python，`ir`/`r-*` → R，`julia-*` → Julia，
+  **其余一律 `plain`**。给 R 格子套 Python 关键词比不套更糟——`function`、`<-`、`TRUE` 是 R 的
+  全部词汇，没有一个属于 Python。`plain` 直接输出纯文本、不产生任何 span，格子上的徽标显示 `<>`；
+  这是"看不懂就不装懂"，而不是缺省成 Python。
+- **每种语言一张正则 + 一个分组判定函数**（`PY_TOKEN`/`R_TOKEN`/`JL_TOKEN` 与
+  `classOfPython`/`classOfR`/`classOfJulia`），不是把三套语法揉进一个正则：分组编号是各语言自己的
+  契约，加一种语言只需再加一对，不用回头数第几个括号。
 - **编辑器是"透明 textarea 叠在高亮副本上"。** 光标、选区、输入法全是原生行为；`data-composing`
   属性在 IME 组字期间把高亮层藏起来，否则拼音候选字看不见。两层字号/行高/内边距必须完全一致。
+- **键盘是编辑器的键盘，不是表单的键盘**（`Cell.onKeyDown`）。`Shift+Enter` 运行并离开、
+  `Ctrl/Cmd+Enter` 原地运行（编辑器不关）、`Ctrl/Cmd+S` 只保存、`Tab`/`Shift+Tab` 缩进/反缩进、
+  `Enter` 继承当前行缩进并在 `:`/`{` 之后多缩一级、`Esc` 退出编辑。`Tab` 必须 `preventDefault`：
+  一个按 Tab 就跳走的编辑器没法用来写代码。IME 组字期间所有键交给输入法（`isComposing`）。
+- **手动改文本就要自己放回光标。** 这些键不经过浏览器的默认插入，所以 `edit(next, start, end)`
+  把目标位置记在 `pendingCaret`，由 `[draft]` 的 effect 在 React 写完新文本后调用
+  `setSelectionRange`——在 handler 里设置会被随后的受控渲染覆盖。
 - **Markdown 也是手写的**（`Markdown` / `mdBlocks` / `mdInline`）：块结构逐行（标题、围栏代码、
   列表含嵌套、表格、引用、分隔线），行内一条正则（代码、加粗、斜体、删除线、链接、图片、
-  裸 URL）。所有节点走 `createElement`，从不拼 HTML 字符串。代码围栏复用同一套高亮。
+  裸 URL）。所有节点走 `createElement`，从不拼 HTML 字符串。代码围栏复用同一套 Python 高亮
+  （围栏自带语言标记，与内核无关）。
 
 ### 4.5 图片存储
 
@@ -349,6 +365,23 @@ dataUrl}`），客户端两种都认。
   通常属于刚刚触发它的那一格的正下方，而不是整本的末尾。
 - **`message` 是给用户的一句话。** 内核动作和导入的告警都通过它回到面板（关闭按钮清掉），
   不写进 `error`：那些不是错误，用红色横幅表示会误导。
+- **原地运行时草稿不能立刻丢。** `Ctrl/Cmd+Enter` 让编辑器留着，而草稿一旦在这里删掉，`draft`
+  就回退成格子里**旧的**源码，文本会肉眼可见地往回跳一次往返。所以 `keepEditing` 时不动草稿，
+  交给"宿主源码已等于草稿"的 effect 在视图到达后清掉它。
+
+无障碍不是事后补丁，而是每个节点的一行属性：
+
+| 位置 | 属性 |
+| --- | --- |
+| 面板根 | `role="region"` + `aria-label`（标题） |
+| 格子列表 / 格子 | `role="list"` / `role="listitem"`、`aria-label="单元格 N"`、`aria-busy`（运行中） |
+| 输出容器 | `role="group"` + `aria-label` |
+| 错误横幅 / 提示条 / 运行标记 | `role="alert"` / `role="status"` / `role="status"` |
+| 图标按钮、折叠、便签徽标 | `aria-label`、`aria-expanded` |
+| 关闭编辑器后 | 焦点回到格子（`tabIndex:-1`），但只在 `document.activeElement === body` 时——用户点别处离开时不抢焦点 |
+
+最后一条是真实的键盘缺陷：textarea 被移除后焦点掉到 `<body>`，下一次 Tab 从页面顶部重新开始，
+而不是从刚运行完的那一格继续。
 
 样式全部写在 `CSS` 模板字符串里，用主题的自定义属性（`--dsh-*`）取色，所以亮/暗主题自动跟随。
 
@@ -490,7 +523,7 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | `test/ipynb.mjs` | `.ipynb` 的往返、丢失项、预算、`nbformat` 版本检查 | 否（纯函数） |
 | `test/notebook.mjs` | 命令、视图、增量渲染、SSE、资源路由、镜像 | 否（注入假 execute） |
 | `test/activity.mjs` | note 文案、批量消息、`agent/pre-step` 的交付与守卫 | 否（假 agent 与假 ctx） |
-| `test/client.mjs` | 注册、渲染路径、点击、流式补丁、memo 身份 | 否（jsdom） |
+| `test/client.mjs` | 注册、渲染路径、点击、流式补丁、memo 身份、高亮语言、键盘、aria | 否（假 React 装载，不跑真实 DOM） |
 | `test/e2e.mjs` | 认证、执行、持久化、超时、内核生命周期 | **是** |
 | `test/register.mjs` | 真 cordis 上下文 + 真 tools 注册表 | 部分（挂载即可） |
 
@@ -502,7 +535,10 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 
 ## 10. 已知边界（有意的）
 
-- 面板是笔记本的**子集**，不是 JupyterLab：无补全、无变量检查器、无调试器。
+- 面板是笔记本的**子集**，不是 JupyterLab：无补全、无变量检查器、无调试器。高亮只有
+  Python / R / Julia 三套词汇，其余内核（Scala、C++ …）只能按纯文本显示——宁可不上色，
+  也不套用错误的语法。
+- **没有命令模式**：`Esc` 是"离开编辑器"，不是 vim 式的普通模式；单元格之间的移动靠按钮或 Tab。
 - `.ipynb` 能读能写，但是**有损的**（§4.7）：`raw` 格变 markdown、面板画不出的 MIME 丢掉、
   超过预算的图与 HTML 丢掉或退化成纯文本、500 格封顶。每一次损失都以 warning 说出去，
   但文件不会再是逐字节原样。

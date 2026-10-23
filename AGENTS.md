@@ -76,6 +76,9 @@ notebook/ipynb/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器
 10. **有意不做的事**（别"顺手"补上，先看 `docs/design.md` §10）：`.ipynb` 的无损往返
     （现在是有损的，每一处丢失都要报 warning）、LaTeX/JSON 输出、虚拟滚动、`jupyter_execute`
     流式、Agent 格子的自动折叠。
+11. **高亮的语言来自内核，不来自笔记本。** `languageFor` 只认 Python/R/Julia，其余一律
+    `plain`（纯文本、不产生 span）。给未知内核套 Python 关键词比不上色更糟：错的语法会被当成
+    对的学。同理，编辑器的键位改动要保住 `Tab` 的 `preventDefault` 与 IME 的 `isComposing` 早退。
 
 ## 验证
 
