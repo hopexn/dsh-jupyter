@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { Notebooks, OutputRenderer, renderableOutputs } from '../lib/notebook.js'
-import { ASSET_ROUTE, NOTEBOOK_ROUTE, STREAM_ROUTE, registerNotebookRoutes } from '../lib/routes.js'
+import { ASSET_ROUTE, DOWNLOAD_ROUTE, NOTEBOOK_ROUTE, STREAM_ROUTE, registerNotebookRoutes } from '../lib/routes.js'
 import { AssetStore } from '../lib/assets.js'
 
 let passed = 0
@@ -603,6 +603,197 @@ await check('discarding notes empties the queue without touching the notebook', 
   assert.equal(watched.pendingNotes(WATCHED), 0)
 })
 
+console.log('\nrun all')
+
+// Its own instance and a gated kernel: a sequence is about ordering and about stopping, and both
+// are only observable while something is still running.
+const sequence = []
+let gateOpen = () => {}
+let gate = Promise.resolve()
+const sequenced = new Notebooks({
+  directory,
+  execute: async (sessionId, code) => {
+    sequence.push(code)
+    await gate
+    return { status: 'ok', executionCount: sequence.length, durationMs: 1, outputs: [{ kind: 'stream', name: 'stdout', text: `${code}\n` }] }
+  },
+  kernelInfo: fake.runtime.kernelInfo,
+})
+const RUNALL = 'run-all-session'
+/** Resolve when the sequence announces that it stopped. */
+function whenSettled(instance, sessionId) {
+  return new Promise((resolve) => {
+    const unsubscribe = instance.subscribe(sessionId, (event) => {
+      if (event.type === 'runall' && event.running === false) {
+        unsubscribe()
+        resolve()
+      }
+    })
+  })
+}
+
+await check('run all executes code cells in order and leaves prose and blanks alone', async () => {
+  const first = (await sequenced.view(RUNALL)).cells[0]
+  await sequenced.command(RUNALL, { action: 'updateCell', id: first.id, source: 'x = 1' })
+  const withMarkdown = await sequenced.command(RUNALL, { action: 'addCell', kind: 'markdown', source: '# Notes' })
+  const markdownId = withMarkdown.cells[1].id
+  const blank = await sequenced.command(RUNALL, { action: 'addCell' })
+  const blankId = blank.cells[2].id
+  const last = await sequenced.command(RUNALL, { action: 'addCell', source: 'print(x)' })
+  sequence.length = 0
+  assert.equal(await sequenced.runAll(RUNALL), true)
+  assert.deepEqual(sequence, ['x = 1', 'print(x)'])
+  const view = await sequenced.view(RUNALL)
+  assert.equal(view.cells[0].status, 'ok')
+  assert.equal(view.cells[1].status, 'idle', 'markdown is prose, not an execution')
+  assert.equal(view.cells[1].id, markdownId)
+  assert.equal(view.cells[2].status, 'idle', 'an empty cell is a blank line')
+  assert.equal(view.cells[2].id, blankId)
+  assert.equal(view.cells[3].status, 'ok')
+  assert.equal(view.cells[3].id, last.cells[3].id)
+})
+
+await check('a sequence announces itself while it runs, and only one can run', async () => {
+  const session = 'run-all-flag'
+  const seen = []
+  const unsubscribe = sequenced.subscribe(session, (event) => { if (event.type === 'runall') seen.push(event.running) })
+  gate = new Promise((resolve) => { gateOpen = resolve })
+  const cell = (await sequenced.view(session)).cells[0]
+  await sequenced.command(session, { action: 'updateCell', id: cell.id, source: 'slow()' })
+  const run = sequenced.runAll(session)
+  // Let the first cell reach the kernel, then look at the flag.
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(sequenced.isRunningAll(session), true)
+  assert.equal(sequenced.isRunning(session), true, 'a cell is executing, not just the sequence')
+  assert.equal(await sequenced.runAll(session), false, 'a second sequence is refused, not queued')
+  gateOpen()
+  await run
+  assert.equal(sequenced.isRunningAll(session), false)
+  assert.deepEqual(seen, [true, false])
+  unsubscribe()
+})
+
+await check('stopping a sequence lets the running cell finish and starts no other', async () => {
+  const session = 'run-all-stop'
+  const cell = (await sequenced.view(session)).cells[0]
+  await sequenced.command(session, { action: 'updateCell', id: cell.id, source: 'one()' })
+  await sequenced.command(session, { action: 'addCell', source: 'two()' })
+  await sequenced.command(session, { action: 'addCell', source: 'three()' })
+  sequence.length = 0
+  gate = new Promise((resolve) => { gateOpen = resolve })
+  const settled = whenSettled(sequenced, session)
+  const view = await sequenced.command(session, { action: 'runAll' })
+  assert.equal(view.runningAll, true, 'the command answers at once, with the stop button armed')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(sequenced.stopRunAll(session), true)
+  gateOpen()
+  await settled
+  assert.deepEqual(sequence, ['one()'], 'the current cell finishes, the next one never starts')
+  assert.equal(sequenced.stopRunAll(session), false, 'nothing left to stop')
+})
+
+await check('an interrupt during a sequence stops the next cell too', async () => {
+  const session = 'run-all-interrupt'
+  const cell = (await sequenced.view(session)).cells[0]
+  await sequenced.command(session, { action: 'updateCell', id: cell.id, source: 'alpha()' })
+  await sequenced.command(session, { action: 'addCell', source: 'beta()' })
+  sequence.length = 0
+  gate = new Promise((resolve) => { gateOpen = resolve })
+  const settled = whenSettled(sequenced, session)
+  sequenced.command(session, { action: 'runAll' })
+  await new Promise((resolve) => setImmediate(resolve))
+  await sequenced.command(session, { action: 'interrupt' })
+  gateOpen()
+  await settled
+  assert.deepEqual(sequence, ['alpha()'], 'interrupt is a decision about the whole sequence')
+})
+
+console.log('\n.ipynb')
+
+await check('export produces an nbformat 4 document with every cell', async () => {
+  const session = 'export-session'
+  const cell = (await notebooks.view(session)).cells[0]
+  await notebooks.command(session, { action: 'updateCell', id: cell.id, source: 'df.head()' })
+  await notebooks.command(session, { action: 'runCell', id: cell.id, source: 'frame' })
+  await notebooks.idle(session)
+  const ran = (await notebooks.view(session)).cells[0]
+  await notebooks.command(session, { action: 'addCell', kind: 'markdown', source: '## Results' })
+  const document = await notebooks.exportDocument(session)
+  assert.equal(document.nbformat, 4)
+  assert.equal(document.nbformat_minor, 5)
+  assert.equal(document.metadata.language_info.name, 'python3', 'the bound kernel names the language')
+  assert.equal(document.cells.length, 2)
+  assert.equal(document.cells[0].cell_type, 'code')
+  assert.equal(document.cells[0].execution_count, ran.executionCount, 'the count the user saw survives')
+  assert.ok(document.cells[0].outputs.some((output) => output.data?.['text/html'] !== undefined))
+  assert.deepEqual(document.cells[1], { cell_type: 'markdown', id: document.cells[1].id, metadata: {}, source: ['## Results'] })
+})
+
+await check('import replaces the notebook, and says what it could not keep', async () => {
+  const session = 'import-session'
+  const document = {
+    nbformat: 4,
+    nbformat_minor: 5,
+    metadata: {},
+    cells: [
+      { cell_type: 'code', source: 'a = 1', execution_count: 4, outputs: [{ output_type: 'stream', name: 'stdout', text: 'hi\n' }] },
+      { cell_type: 'raw', source: 'raw' },
+    ],
+  }
+  const view = await notebooks.command(session, { action: 'importNotebook', document })
+  assert.equal(view.cells.length, 2)
+  assert.equal(view.cells[0].source, 'a = 1')
+  assert.equal(view.cells[0].executionCount, 4)
+  assert.equal(view.cells[0].status, 'ok', 'imported output means the cell has run')
+  assert.equal(view.cells[1].kind, 'markdown')
+  assert.match(view.message, /raw cell/)
+})
+
+await check('import can append instead of replacing', async () => {
+  const session = 'import-append'
+  const document = { nbformat: 4, cells: [{ cell_type: 'code', source: 'b = 2', outputs: [] }] }
+  await notebooks.command(session, { action: 'importNotebook', document })
+  const view = await notebooks.command(session, { action: 'importNotebook', document, mode: 'append' })
+  assert.deepEqual(view.cells.map((cell) => cell.source), ['b = 2', 'b = 2'])
+})
+
+await check('a bad document fails the command instead of emptying the notebook', async () => {
+  const session = 'import-bad'
+  const before = await notebooks.view(session)
+  await notebooks.command(session, { action: 'updateCell', id: before.cells[0].id, source: 'keep me' })
+  await assert.rejects(
+    () => notebooks.command(session, { action: 'importNotebook', document: { nbformat: 3 } }),
+    /nbformat 3 is not supported/,
+  )
+  const after = await notebooks.view(session)
+  assert.equal(after.cells[0].source, 'keep me', 'a refused import must not have half-applied')
+})
+
+await check('an imported notebook is announced as one replace, and the model is told', async () => {
+  const session = 'import-events'
+  const streamed = []
+  const unsubscribe = watched.subscribe(session, (event) => streamed.push(event.type))
+  const document = { nbformat: 4, cells: [{ cell_type: 'code', source: 'c = 3', outputs: [] }, { cell_type: 'markdown', source: 'x' }] }
+  await watched.command(session, { action: 'importNotebook', document })
+  unsubscribe()
+  assert.deepEqual(streamed.filter((type) => type === 'replace').length, 1, 'one frame, not one per cell')
+  const note = lastEvent()
+  assert.equal(note.event.type, 'import')
+  assert.equal(note.event.mode, 'replace')
+  assert.equal(note.event.count, 2)
+})
+
+await check('an exported notebook imports back with its sources and outputs', async () => {
+  const from = 'round-trip-from'
+  const cell = (await notebooks.view(from)).cells[0]
+  await notebooks.command(from, { action: 'updateCell', id: cell.id, source: 'round_trip = True' })
+  await notebooks.command(from, { action: 'addCell', kind: 'markdown', source: 'prose *here*' })
+  const document = await notebooks.exportDocument(from)
+  const to = 'round-trip-to'
+  const view = await notebooks.command(to, { action: 'importNotebook', document })
+  assert.deepEqual(view.cells.map((entry) => [entry.kind, entry.source]), [['code', 'round_trip = True'], ['markdown', 'prose *here*']])
+})
+
 console.log('\nhttp route')
 
 const registered = []
@@ -628,8 +819,8 @@ await check('the route registers when Connection arrives later, not only at moun
   assert.deepEqual(seen, [], 'a pending registration reports nothing yet')
 
   deliver(childContext({ fetch: { register: (route) => { routes.push(route); return () => {} } } }))
-  assert.equal(routes.length, 3, 'the notebook route, its output stream, and the asset route')
-  assert.deepEqual(routes.map((entry) => entry.path).sort(), [ASSET_ROUTE, NOTEBOOK_ROUTE, STREAM_ROUTE].sort())
+  assert.equal(routes.length, 4, 'the notebook route, its output stream, the asset route, and the export')
+  assert.deepEqual(routes.map((entry) => entry.path).sort(), [ASSET_ROUTE, DOWNLOAD_ROUTE, NOTEBOOK_ROUTE, STREAM_ROUTE].sort())
   assert.deepEqual(seen, ['registered'])
 })
 await check('a headless profile reports the panel as unavailable instead of throwing', () => {
@@ -658,13 +849,15 @@ registerNotebookRoutes(
 const route = registered.find((entry) => entry.path === NOTEBOOK_ROUTE)
 const streamRoute = registered.find((entry) => entry.path === STREAM_ROUTE)
 const assetRoute = registered.find((entry) => entry.path === ASSET_ROUTE)
+const downloadRoute = registered.find((entry) => entry.path === DOWNLOAD_ROUTE)
 
 await check('the registered route carries the panel protocol', () => {
-  assert.equal(registered.length, 3)
+  assert.equal(registered.length, 4)
   assert.deepEqual([...route.methods].sort(), ['GET', 'POST'])
   assert.equal(route.requestBody, 'buffered')
   assert.deepEqual([...streamRoute.methods], ['GET'])
   assert.deepEqual([...assetRoute.methods], ['GET'])
+  assert.deepEqual([...downloadRoute.methods], ['GET'])
   assert.deepEqual(states, ['registered'])
 })
 
@@ -731,6 +924,30 @@ await check('the asset route serves the bytes with an immutable cache header', a
 await check('the asset route answers 404 for a name it never issued', async () => {
   const response = await assetRoute.fetch(new Request(`http://127.0.0.1:19387${ASSET_ROUTE}?name=../../etc/passwd`, { method: 'GET' }))
   assert.equal(response.status, 404)
+})
+
+await check('the download route serves the notebook as an nbformat file', async () => {
+  await notebooks.command(SESSION, { action: 'setPath', path: 'reports/q3 analysis.ipynb' })
+  const response = await downloadRoute.fetch(new Request(`http://127.0.0.1:19387${DOWNLOAD_ROUTE}?sessionId=${SESSION}`, { method: 'GET' }))
+  assert.equal(response.status, 200)
+  assert.match(response.headers.get('content-type'), /application\/x-ipynb\+json/)
+  // A space would break the quoted header, so it becomes an underscore; the extension is kept.
+  assert.equal(response.headers.get('content-disposition'), 'attachment; filename="q3_analysis.ipynb"')
+  const document = await response.json()
+  assert.equal(document.nbformat, 4)
+  assert.ok(document.cells.length > 0)
+  assert.equal(document.cells[0].cell_type, 'code')
+})
+
+await check('a session without a path still downloads as notebook.ipynb', async () => {
+  const response = await downloadRoute.fetch(new Request(`http://127.0.0.1:19387${DOWNLOAD_ROUTE}?sessionId=no-path-session`, { method: 'GET' }))
+  assert.equal(response.headers.get('content-disposition'), 'attachment; filename="notebook.ipynb"')
+})
+
+await check('the download route without a session reports the error', async () => {
+  const response = await downloadRoute.fetch(new Request(`http://127.0.0.1:19387${DOWNLOAD_ROUTE}`, { method: 'GET' }))
+  assert.equal(response.status, 200, 'a client-visible failure, not a server fault')
+  assert.match((await response.json()).error, /sessionId is required/)
 })
 
 await check('the stream route pushes a running cell\'s output as it arrives', async () => {

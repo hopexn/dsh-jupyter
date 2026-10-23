@@ -180,6 +180,19 @@ await check('a reset drops the notes it invalidates', async () => {
   assert.match(notes[0].text, /variables were not touched/)
 })
 
+await check('an import says the whole notebook changed, and points at the dropped items', async () => {
+  const [note] = notesOf([{ type: 'import', count: 12, mode: 'replace', dropped: 2 }])
+  assert.equal(note.summary, 'Imported a notebook')
+  assert.equal(note.key, 'import')
+  assert.match(note.text, /12 cells replaced the notebook/)
+  assert.match(note.text, /2 item\(s\) could not be represented/)
+  assert.match(note.text, /read the notebook again/)
+  const [appended] = notesOf([{ type: 'import', count: 3, mode: 'append', dropped: 0 }])
+  assert.equal(appended.summary, 'Appended a notebook')
+  assert.match(appended.text, /3 cells appended to the notebook/)
+  assert.doesNotMatch(appended.text, /could not be represented/)
+})
+
 await check('a rendered markdown cell is announced without touching the kernel', async () => {
   const [note] = notesOf([{ type: 'markdown', index: 4, id: 'cell-e', source: '# Findings' }])
   assert.equal(note.summary, 'Rendered markdown cell 5')

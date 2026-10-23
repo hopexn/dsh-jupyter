@@ -1,7 +1,7 @@
 /**
  * Run every test suite in one command.
  *
- * The four offline suites need nothing but Node, so they always run. `e2e` and `register` need a
+ * The five offline suites need nothing but Node, so they always run. `e2e` and `register` need a
  * live Jupyter server and (for `register`) the DSH packages; running them against a server that
  * is not there produces a wall of connection errors that says nothing about the change. They are
  * therefore included only when `JUPYTER_TEST_URL` is set:
@@ -21,6 +21,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 /** Suites that never touch the network. */
 const OFFLINE = [
   'test/transport.mjs',
+  'test/ipynb.mjs',
   'test/notebook.mjs',
   'test/activity.mjs',
   'test/client.mjs',
