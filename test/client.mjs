@@ -283,7 +283,7 @@ await check('it registers both dictionaries with every key the UI asks for', () 
   assert.equal(page.registered.locales[0].ns, 'jupyterlab')
   assert.deepEqual(Object.keys(page.registered.locales[0].dicts).sort(), ['en', 'zh'])
   const english = page.registered.locales[0].dicts.en
-  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss', 'cellLabel', 'outputLabel', 'toCode', 'toMarkdown', 'editorHint']) {
+  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss', 'cellLabel', 'outputLabel', 'toCode', 'toMarkdown', 'editorHint', 'changed', 'changedByAgent', 'keepChange', 'undoChange']) {
     assert.equal(typeof english[key], 'string', `missing translation "${key}"`)
   }
 })
@@ -762,6 +762,76 @@ await check('an agent-created cell is marked, a user cell is not', () => {
   assert.equal(textOf(chip), 'agent')
   const userCell = renderCell(page, cellOf())
   assert.equal(flatten(userCell).find((node) => node.props?.className === 'dshj-origin'), undefined)
+})
+
+console.log('\nthe model\'s rewrite')
+
+await check('a rewritten cell offers its diff; an ordinary cell does not', () => {
+  const rewritten = renderCell(page, cellOf({ source: 'x = 2', previousSource: 'x = 1' }))
+  const chip = flatten(rewritten).find((node) => node.props?.className === 'dshj-changed')
+  assert.ok(chip !== undefined, 'the change must be visible without opening anything')
+  assert.equal(chip.type, 'button', 'and openable')
+  assert.equal(chip.props['aria-expanded'], 'false')
+  const plain = renderCell(page, cellOf({ source: 'x = 2' }))
+  assert.equal(flatten(plain).find((node) => node.props?.className === 'dshj-changed'), undefined)
+})
+
+await check('the diff says which lines were removed and which were added', () => {
+  const rendered = renderCellIn(page, cellOf({ source: 'x = 1\ny = 3', previousSource: 'x = 1\ny = 2' }), {
+    props: { diffOpen: true },
+  })
+  const rows = flatten(rendered).filter((node) => typeof node.props?.className === 'string'
+    && node.props.className.startsWith('dshj-diff-row'))
+  assert.equal(rows.length, 3, 'one unchanged line, one removal, one addition')
+  assert.match(rows[0].props.className, /dshj-diff-same/)
+  assert.match(rows[1].props.className, /dshj-diff-del/)
+  assert.equal(textOf(rows[1]), '-y = 2')
+  assert.match(rows[2].props.className, /dshj-diff-add/)
+  assert.equal(textOf(rows[2]), '+y = 3')
+})
+
+await check('a closed diff renders no rows at all', () => {
+  const rendered = renderCellIn(page, cellOf({ source: 'x = 2', previousSource: 'x = 1' }), { props: { diffOpen: false } })
+  assert.equal(flatten(rendered).filter((node) => node.props?.className === 'dshj-diff').length, 0)
+})
+
+await check('keep and undo are the two endings, and both are one command', () => {
+  const calls = []
+  const rendered = renderCellIn(page, cellOf({ source: 'x = 2', previousSource: 'x = 1' }), {
+    props: {
+      diffOpen: true,
+      onAcceptDiff: (id) => calls.push(['accept', id]),
+      onRevertDiff: (id) => calls.push(['revert', id]),
+    },
+  })
+  const keep = flatten(rendered).find((node) => node.type === 'button' && textOf(node) === 'keepChange')
+  const undo = flatten(rendered).find((node) => node.type === 'button' && textOf(node) === 'undoChange')
+  assert.ok(keep !== undefined && undo !== undefined, 'the diff needs a way to end')
+  keep.props.onClick()
+  undo.props.onClick()
+  assert.deepEqual(calls, [['accept', 'c1'], ['revert', 'c1']])
+})
+
+await check('which diff is open belongs to the panel, not to the cell', async () => {
+  const view = viewOf([cellOf({ source: 'x = 2', previousSource: 'x = 1' })], { revision: 160 })
+  const fetchState = installFetch(view)
+  try {
+    page.React.reset()
+    page.slots.length = 0
+    page.slots[0] = view
+    const Notebook = page.component('sidebar.right.pane.tab')
+    const tree = Notebook({ sessionId: 's-diff', t: (key) => key })
+    const cellNode = findComponent(tree, (props) => props.cell?.id === 'c1')
+    assert.equal(cellNode.props.diffOpen, false)
+    // One diff at a time: the panel keeps the id, so a second cell cannot open a second one.
+    cellNode.props.onToggleDiff('c1')
+    page.React.reset()
+    const opened = Notebook({ sessionId: 's-diff', t: (key) => key })
+    assert.equal(findComponent(opened, (props) => props.cell?.id === 'c1').props.diffOpen, true,
+      'the click must survive the next render')
+  } finally {
+    fetchState.restore()
+  }
 })
 
 console.log('\nrun all, import, and drafts')

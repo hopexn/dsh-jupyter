@@ -146,6 +146,51 @@ await check('updateCell replaces the source', async () => {
   assert.equal(view.cells[1].source, 'b = 2')
 })
 
+await check('a model rewrite keeps what it replaced; a user edit clears it', async () => {
+  const session = 'diff-session'
+  const first = (await notebooks.view(session)).cells[0]
+  await notebooks.command(session, { action: 'updateCell', id: first.id, source: 'x = 1\ny = 2' })
+  const rewritten = await notebooks.command(session, {
+    action: 'updateCell',
+    id: first.id,
+    source: 'x = 1\ny = 3',
+    origin: 'agent',
+  }, {}, { note: false })
+  assert.equal(rewritten.cells[0].source, 'x = 1\ny = 3')
+  assert.equal(rewritten.cells[0].previousSource, 'x = 1\ny = 2', 'the replaced text is kept for the diff')
+  // A second rewrite keeps the first baseline: the diff is everything that changed since the user
+  // last touched the cell, not just the last hop.
+  const again = await notebooks.command(session, {
+    action: 'updateCell',
+    id: first.id,
+    source: 'x = 1\ny = 4',
+    origin: 'agent',
+  }, {}, { note: false })
+  assert.equal(again.cells[0].previousSource, 'x = 1\ny = 2')
+  // The model-facing snapshot is a summary, not the panel state: the extra field would be noise.
+  assert.equal(notebooks.snapshot(session).cells[0].previousSource, undefined)
+
+  const edited = await notebooks.command(session, { action: 'updateCell', id: first.id, source: 'x = 9' })
+  assert.equal(edited.cells[0].previousSource, null, 'typing over it accepts it')
+})
+
+await check('dismissDiff keeps the model version, revertCell puts the old one back', async () => {
+  const session = 'diff-revert'
+  const first = (await notebooks.view(session)).cells[0]
+  await notebooks.command(session, { action: 'updateCell', id: first.id, source: 'print(1)' })
+  await notebooks.command(session, { action: 'updateCell', id: first.id, source: 'print(2)', origin: 'agent' }, {}, { note: false })
+
+  const accepted = await notebooks.command(session, { action: 'dismissDiff', id: first.id })
+  assert.equal(accepted.cells[0].source, 'print(2)')
+  assert.equal(accepted.cells[0].previousSource, null)
+  await assert.rejects(() => notebooks.command(session, { action: 'revertCell', id: first.id }), /no earlier version/)
+
+  await notebooks.command(session, { action: 'updateCell', id: first.id, source: 'print(3)', origin: 'agent' }, {}, { note: false })
+  const reverted = await notebooks.command(session, { action: 'revertCell', id: first.id })
+  assert.equal(reverted.cells[0].source, 'print(2)', 'undo is one command, not a second edit')
+  assert.equal(reverted.cells[0].previousSource, null)
+})
+
 await check('moveCell reorders and refuses to fall off either end', async () => {
   const cells = (await notebooks.view(SESSION)).cells
   const moved = await notebooks.command(SESSION, { action: 'moveCell', id: cells[2].id, delta: -1 })
