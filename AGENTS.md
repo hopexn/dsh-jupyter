@@ -41,15 +41,16 @@ lib/dns-cache.js 进程级解析缓存
 lib/websocket.js 最小 RFC 6455 客户端（内核通道）
 lib/kernel.js    内核消息协议、输出归一化、产物落盘
 lib/notebook.js  面板模型：单元格、增量渲染、后台运行、镜像、模型侧读写
+lib/ipynb.js     .ipynb 的读写（纯函数，无 I/O：调用方注入 image 回调）
 lib/activity.js  面板活动 → 模型的上下文：缓冲、note 文案、agent/pre-step 交付
 lib/assets.js    内容寻址图片仓库
-lib/routes.js    三条同源路由 + SSE
+lib/routes.js    四条同源路由 + SSE
 lib/client.js    浏览器半边（工厂字符串，无构建、无 JSX）
 ```
 
 **两半的生效方式不同**：宿主半边（`index/runtime/server/transport/dns-cache/websocket/kernel/
-notebook/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器半边（`client.js`）刷新页面即可。
-先确认自己在改哪一半，否则会以为改动没生效。
+notebook/ipynb/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器半边（`client.js`）刷新
+页面即可。先确认自己在改哪一半，否则会以为改动没生效。
 
 ## 不能破的约束
 
@@ -72,14 +73,16 @@ notebook/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器半边
    被收尾事件重新加回来。`insert` 要带 `index`，客户端才能把它放在正确的位置。
 9. **测试服务器不要 `disable_check_xsrf`。** 它会把真实的 XSRF 缺陷藏起来——第一轮就是这么
    漏掉 `X-XSRFToken` 的。
-10. **有意不做的事**（别"顺手"补上，先看 `docs/design.md` §10）：`.ipynb` 导入导出、
-    LaTeX/JSON 输出、虚拟滚动、`jupyter_execute` 流式、Agent 格子的自动折叠。
+10. **有意不做的事**（别"顺手"补上，先看 `docs/design.md` §10）：`.ipynb` 的无损往返
+    （现在是有损的，每一处丢失都要报 warning）、LaTeX/JSON 输出、虚拟滚动、`jupyter_execute`
+    流式、Agent 格子的自动折叠。
 
 ## 验证
 
 ```bash
 node test/transport.mjs   # 传输层，自带 peer，无需 Jupyter
-node test/notebook.mjs    # 面板模型与三条路由
+node test/ipynb.mjs       # .ipynb 往返与丢失项（纯函数）
+node test/notebook.mjs    # 面板模型与四条路由
 node test/activity.mjs    # 面板活动 → 模型上下文（note 文案、交付守卫）
 node test/client.mjs      # 浏览器半边（假 React 装载，不跑真实 DOM）
 
@@ -94,7 +97,9 @@ node test/register.mjs    # 需要 node_modules 链接到 DSH 包
 ln -s <extracted-dsh-packages>/node_modules node_modules
 ```
 
-改动只涉及渲染或面板行为时，离线四套够了；动了协议、认证、生命周期，必须跑 `e2e`。
+`npm test` 跑全部七套（`scripts/test-all.mjs`）：五条离线套件总会跑，`e2e` 与 `register` 只在
+`JUPYTER_TEST_URL` 存在时加入。只改渲染或面板行为时，离线五套够了；动了协议、认证、生命周期，
+必须跑 `e2e`。
 
 ## 提交
 

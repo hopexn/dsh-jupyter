@@ -22,6 +22,9 @@
 | 执行协议（execute_request / iopub / 中断） | §2.2 | `lib/kernel.js`: `KernelConnection.execute` `#runOne` | `test/e2e.mjs` |
 | 出站 HTTP / DNS / WebSocket | §5.1 | `lib/transport.js` `lib/dns-cache.js` `lib/websocket.js` | `test/transport.mjs` |
 | 面板命令与视图字段 | §3.2 §4.1 | `lib/notebook.js`: `Notebooks.command` `Notebooks.view` | `test/notebook.mjs` |
+| `.ipynb` 导入导出 | §4.7 | `lib/ipynb.js`: `notebookToIpynb` `ipynbToCells`；`lib/routes.js`: `DOWNLOAD_ROUTE` | `test/ipynb.mjs` `test/notebook.mjs` |
+| 全部运行 / 停止 | §2.2 | `lib/notebook.js`: `runAll` `stopRunAll` `isRunningAll` | `test/notebook.mjs` |
+| 未保存的草稿、折叠长输出 | §4.6 | `lib/client.js`: `readDrafts` `writeDrafts` `Collapsible` | `test/client.mjs` |
 | 面板改动如何告知模型 | §2.3 | `lib/activity.js`: `NotebookActivity` `messageForNotes` `registerContextInjection` | `test/activity.mjs` |
 | 面板新增路由 / 改协议 | §4.2 | `lib/routes.js`: `registerNotebookRoutes` | `test/notebook.mjs` |
 | MIME 优先级、输出预算 | §4.3 | `lib/notebook.js`: `OutputRenderer.#bundle` `renderableOutputs` | `test/notebook.mjs` |
@@ -116,6 +119,10 @@ client onRun ─ POST {action:'runCell', id, source}
   和"非流式执行"逐字节一致；增量那份允许被丢弃。
 - **markdown 单元格不碰内核。** `runCell` 遇到 `kind === 'markdown'` 直接渲染，不启动内核，
   所以在没有内核的服务器上也不会失败。
+- **全部运行是一串后台执行，不是一次请求。** `runAll` 先取一份 id 快照，逐格 `await`，每格之前
+  重新确认笔记本还在（`reset` 会把它扔掉）。中途新增的格子不会被补进来——否则一个会追加格子的
+  单元格能让序列永不结束。`stopRunAll`（`interrupt` 也会置位）只影响**下一格**：正在跑的那格
+  照常收尾，中断它仍然由 `interrupt` 负责。
 - **串行化在 `KernelConnection.#queue`。** iopub 消息里没有 request id，同一内核并发执行会串台；
   面板和工具共用这个队列，谁的先到谁先跑。
 
@@ -177,7 +184,7 @@ jupyter_execute
 
 ### 3.2 笔记本（宿主，按会话）
 
-`Notebooks` 里四张表，各自负责一件事：
+`Notebooks` 里五张表，各自负责一件事：
 
 | 私有字段 | 内容 | 生命周期 |
 | --- | --- | --- |
@@ -185,6 +192,7 @@ jupyter_execute
 | `#pendingPersistence` | 会话 → 延迟写盘的 timer | 大笔记本 60 ms 合并写 |
 | `#listeners` | 会话 → SSE 订阅者集合 | 流断开即移除 |
 | `#runs` | 会话 → 在飞的 Promise 集合 | `idle()` / `dispose()` 等它 |
+| `#runningAll` | 会话 → `{stop}` | 全量运行的停止标志；`dispose()` 会把它们全部置位 |
 
 单元格结构（`CellView`）：`id` `kind` `source` `rev` `status` `executionCount` `durationMs`
 `outputs` `error`。
@@ -199,6 +207,8 @@ jupyter_execute
 深拷贝只会把 base64 图再复制一遍。`view()` 只在有待发 note 时带 `pendingNotes`（头部徽标的计数）
 与 `notes`（`[{key, summary}]`，点开徽标看的就是它）；`?since=<revision>` 命中时同样带这两个
 字段，不碰 Jupyter——note 被取走后 revision 不变，徽标与列表只能靠这个短答案归零。
+`runningAll` 是同一类字段：全量运行在两格之间不改 revision，`?since=` 命中时也要带上它，
+否则停止按钮会一直亮着。
 
 **落盘。** `isHeavy()` 只看长度不序列化；轻的立即写，重的延迟 60 ms 合并写；跑之前和
 `dispose()` 强制落盘。写文件是 `tmp + rename`，紧凑 JSON（缩进对大 payload 是纯浪费）。
@@ -209,11 +219,14 @@ jupyter_execute
 | --- | --- | --- |
 | `insert` | `revision` + `index` + 完整 cell | 新格子出现（模型运行）；客户端按位置插入，重复 id 替换 |
 | `cell` | `revision` + 完整 cell | 开始/结束的权威状态；不合并，立即下发 |
+| `replace` | `revision` + 完整 cells 列表 | 导入 `.ipynb`：整本换掉，一帧而不是一格一帧 |
+| `runall` | `running` + `revision` | 全量运行开始/结束；不改格子，也不改 revision |
 | `append` | `cellId` + 一条 output | 新增输出（text/html/markdown/image/error） |
 | `text` | `cellId` + `index` + `text` | 向第 index 条输出追加文本 |
 | `clear` | `cellId` | 内核 `clear_output` |
 
-`append` / `text` 按 60 ms 合并成帧；`cell` 与 `insert` 立即发，否则列表和状态行会滞后于输出。
+`append` / `text` 按 60 ms 合并成帧；`cell`、`insert`、`replace`、`runall` 立即发，否则列表、
+状态行和停止按钮会滞后于输出。
 
 ---
 
@@ -230,7 +243,9 @@ jupyter_execute
 | `clearOutput` | 清一个格子的输出 | |
 | `clearAllOutputs` | 清全部 | |
 | `runCell` | 保存草稿并执行（markdown 直接渲染） | 立即返回，输出走 SSE |
-| `startKernel` / `interrupt` / `restartKernel` | 内核生命周期 | 结果塞进 `message` |
+| `runAll` | 顺序执行所有非空 code 格 | 立即返回；`stopOnError` 可选；停止靠 `interrupt` 或 `stopRunAll` |
+| `importNotebook` | 用 `.ipynb` 的 JSON 替换（`mode:'append'` 则追加） | 整本一个 `replace` 事件；无法保留的内容放进 `message` |
+| `startKernel` / `interrupt` / `restartKernel` | 内核生命周期 | 结果塞进 `message`；`interrupt` 同时停掉全量运行的后续格 |
 | `discardNotes` | 丢弃待交给模型的 note | 不改 revision，只清缓冲 |
 | `setPath` | 设置笔记本路径 | 尚未用于读写 `.ipynb` |
 | `reset` | 丢弃内存与镜像 | 测试与"新建"用 |
@@ -243,6 +258,7 @@ jupyter_execute
 | `POST` | `/api/jupyterlab/notebook` | JSON：`sessionId` + `action` + 参数 | 新视图；失败时为 `{error}` |
 | `GET` | `/api/jupyterlab/notebook/stream` | `sessionId` | `text/event-stream` |
 | `GET` | `/api/jupyterlab/asset` | `name=<sha20>.<ext>` | 图片字节，`immutable` |
+| `GET` | `/api/jupyterlab/notebook/download` | `sessionId` | `.ipynb` 文件，`attachment` |
 
 约定：
 
@@ -319,7 +335,65 @@ dataUrl}`），客户端两种都认。
 3. **编辑器高度靠 `fit()`**：textarea 自适应，高亮层绝对定位跟随；改 CSS 时两层的
    `font` / `line-height` / `padding` 必须同源。
 
+草稿与折叠是两块纯客户端状态，宿主完全不知道它们存在：
+
+- **草稿存在 `sessionStorage`（`dshj:draft:<session>`）**，存的是 `{editing, drafts}`。草稿刻意
+  不是命令——宿主从没见过用户打的字——所以只有浏览器自己能把它救回来，一次 F5 曾经能吞掉
+  写了一半的段落。用 `sessionStorage` 而不是 `localStorage`：草稿属于这个标签页，随标签页消失；
+  写回只在**视图到达之后**发生，否则首帧会用空状态把刚读出来的草稿抹掉。草稿在两种情况下失效：
+  格子被删了，或宿主里的源码已经等于它（那说明别人保存了）。
+- **长输出默认折叠**：纯文本超过 24 行或 4000 字符、HTML 超过 2000 字符时加一层
+  `Collapsible`（`data-open` + 一行渐变），展开状态留在组件本地。`useState` 在早退分支之前
+  调用，所以输出在运行中越过阈值时组件不会重挂、已展开的不会被折回去。
+- **`+` 是插入点。** 每一格的工具栏都有 `addCell` + `afterId`：分析是自上而下读的，新想法
+  通常属于刚刚触发它的那一格的正下方，而不是整本的末尾。
+- **`message` 是给用户的一句话。** 内核动作和导入的告警都通过它回到面板（关闭按钮清掉），
+  不写进 `error`：那些不是错误，用红色横幅表示会误导。
+
 样式全部写在 `CSS` 模板字符串里，用主题的自定义属性（`--dsh-*`）取色，所以亮/暗主题自动跟随。
+
+---
+
+## 4.7 `.ipynb`
+
+`lib/ipynb.js` 里两个纯函数，不碰文件系统、不碰网络：`notebookToIpynb(cells, {language, readAsset})`
+与 `ipynbToCells(document, {putAsset})`。调用方（`Notebooks.exportDocument` / `importDocument`）
+负责注入那两个回调，所以格式本身能用单元测试覆盖。
+
+**导出**
+
+- `nbformat: 4`、`nbformat_minor: 5`；每个 cell 带 `id`（由内部 id 清洗得到，跨次导出稳定，
+  否则 JupyterLab 的 diff 会认为每个 cell 都变了）。
+- `source` 按格式要求切成行数组：每行带 `\n`，最后一行可以不带；空文本是 `[]`。
+- `execution_count` 原样保留——导出的是**这份分析**，把计数清零会让它看起来没跑过。
+- **不写 `kernelspec`。** 面板最多知道内核名，而错误的 kernelspec 会让 JupyterLab 提议启动一个
+  不存在的内核；`language_info.name` 足够打开。语言取自绑定的内核（Julia/R 会话不会被写成 Python）。
+- 图片：cell 里存的是 `?name=<hash>`，导出时用 `readAsset` 换回字节；字节已经不在（缓存被 LRU
+  清掉又没落盘）时**丢掉这条输出**，而不是写一个坏引用。
+- `text/html` / `text/markdown` / `text/plain` / `stream` / `error` 都能往返。`error` 的
+  `traceback` 放整段文本、`ename` 用通用的 `Error`：面板只保留了渲染后的文本，编一个异常名是
+  它无法支撑的谎。
+
+**导入**
+
+- `nbformat` 不是 4 就抛错，不做猜测；文档为空也至少给一个可编辑的 code 格。
+- `source` 字符串和行数组都接受（两种都在真实文件里出现过）。
+- `raw` 格导入为 markdown 并留一条 warning（它本来就是不渲染的文本，markdown 最接近）；
+  未知 `cell_type` 跳过并留 warning；未知输出类型同理。**丢东西总要说出来**。
+- 预算与渲染器一致：单图 > 2 MiB 丢掉、每格最多 8 张、`text/html` > 256 KiB 退回纯文本、
+  单个输出 200 000 字符截断、整本最多 500 格（面板没有虚拟滚动）。这些都是 warning。
+- 图片经 `putAsset` 进 `AssetStore`，所以导入一本满是图的笔记本不会把 JSON 撑大；没有仓库时
+  退回 `data:` URL。
+- 导入的格子一律 `origin: 'user'`：文件是用户的，不管最初是谁写的。`status` 由输出推出来
+  （有 traceback 就是 `error`），否则一个报错的格子会顶着一张 idle 的脸。
+
+**入口**
+
+- 导出走 `GET /api/jupyterlab/notebook/download`，`Content-Disposition: attachment`。用链接而不是
+  命令：交给浏览器的保存对话框，文件名由服务端决定，也不用让几 MB 的 JSON 在客户端绕一圈。
+  文件名只保留 ASCII——`Content-Disposition` 是字节，中文名要么上 RFC 5987 要么就是乱码。
+- 导入走 `POST importNotebook`，客户端先 `JSON.parse` 再发：不是 JSON 的文件在浏览器里就能报
+  "这不是笔记本"，不必往返一次。
 
 ---
 
@@ -400,9 +474,10 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | `lib/websocket.js` | RFC 6455 客户端（够用即可） | `KernelSocket` |
 | `lib/kernel.js` | 内核消息协议、输出归一化、产物落盘 | `KernelConnection` `summarizeOutputs` `collectArtifacts` |
 | `lib/notebook.js` | 面板模型：单元格、增量渲染、后台运行、镜像 | `Notebooks` `OutputRenderer` `renderableOutputs` |
+| `lib/ipynb.js` | `nbformat` 4 的读写（纯函数，无 I/O） | `notebookToIpynb` `ipynbToCells` |
 | `lib/activity.js` | 面板活动的缓冲与交付：note 文案、批量消息、`agent/pre-step` 钩子 | `NotebookActivity` `messageForNotes` `registerContextInjection` |
 | `lib/assets.js` | 内容寻址图片仓库 | `AssetStore` `assetUrl` |
-| `lib/routes.js` | 三条同源路由 + SSE | `registerNotebookRoutes` `*_ROUTE` |
+| `lib/routes.js` | 四条同源路由 + SSE | `registerNotebookRoutes` `*_ROUTE` |
 | `lib/client.js` | 浏览器半边：侧栏页签与笔记本 UI | `TYPE_ID` `KIND`（其余在工厂内） |
 
 ---
@@ -412,6 +487,7 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | 套件 | 覆盖 | 需要 Jupyter |
 | --- | --- | --- |
 | `test/transport.mjs` | DNS 缓存、连接复用、`Host`、帧编解码 | 否（自带 peer） |
+| `test/ipynb.mjs` | `.ipynb` 的往返、丢失项、预算、`nbformat` 版本检查 | 否（纯函数） |
 | `test/notebook.mjs` | 命令、视图、增量渲染、SSE、资源路由、镜像 | 否（注入假 execute） |
 | `test/activity.mjs` | note 文案、批量消息、`agent/pre-step` 的交付与守卫 | 否（假 agent 与假 ctx） |
 | `test/client.mjs` | 注册、渲染路径、点击、流式补丁、memo 身份 | 否（jsdom） |
@@ -426,7 +502,14 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 
 ## 10. 已知边界（有意的）
 
-- 面板是笔记本的**子集**，不是 JupyterLab：无补全、无变量检查器、无 `.ipynb` 导入导出。
+- 面板是笔记本的**子集**，不是 JupyterLab：无补全、无变量检查器、无调试器。
+- `.ipynb` 能读能写，但是**有损的**（§4.7）：`raw` 格变 markdown、面板画不出的 MIME 丢掉、
+  超过预算的图与 HTML 丢掉或退化成纯文本、500 格封顶。每一次损失都以 warning 说出去，
+  但文件不会再是逐字节原样。
+- 全量运行只保证"顺序执行现有的非空 code 格"：中途新增的格子不补跑，正在跑的那格不会被
+  单独取消（停止是"跑完这格",中断是"杀掉这格"两个动作）。
+- 草稿存在标签页里（`sessionStorage`）：换标签页、换设备都看不到，这是有意的——它是打字中的
+  东西，不是文档。
 - 输出只画图片、`text/html`、`text/markdown`、纯文本；`application/json`、LaTeX 只报 MIME 名。
 - HTML 输出经清洗，所以依赖自身 `<script>` 的东西（交互 widget、plotly）只画静态部分。
 - `jupyter_execute` 不流式：模型一次拿全结果更省轮次；长任务的进度看面板。

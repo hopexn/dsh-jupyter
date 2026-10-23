@@ -39,6 +39,17 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
   request: the cell's draft travels with the run instead of being saved first. Outputs render
   beneath the cell: stdout, stderr, the value of the last expression, tracebacks, images
   (PNG/JPEG/GIF/WebP), markdown, and HTML.
+- **Run all**: executes every non-empty code cell top to bottom, in one sequence, waiting for each
+  to finish so cell 3 sees what cell 2 defined. While it runs the button reads `Stop`: it interrupts
+  the cell that is executing and starts no more. Markdown cells and empty cells are skipped, and
+  cells added during the sequence are not picked up.
+- **Insert in the middle**: `+` in a cell's header adds a cell directly below it, instead of only
+  at the end of the notebook.
+- **Unsaved edits survive a reload**: text you typed but have not committed is parked in the tab's
+  `sessionStorage`, so an accidental F5 brings the editor back with the text in it. It never leaves
+  the browser — a draft is not a command.
+- **Long outputs fold**: past 24 lines (or 4 000 characters, or 2 000 for HTML) an output starts
+  collapsed with a `Show more` toggle, so one log-heavy cell cannot push the rest off the screen.
 - **Rich output**: a MIME bundle is rendered by its richest representation the panel can draw.
   `text/html` — what pandas, polars and Styler emit — mounts as a real table inside a shadow root,
   so its own CSS applies while it cannot reach the panel; the HTML is stripped of scripts and event
@@ -61,6 +72,11 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
   the notebook is a record of the whole analysis rather than the user's half of it. When nothing
   changed the answer is two fields and never reaches Jupyter.
 - **Kernel**: the header shows the bound kernel and offers `Interrupt` and `Restart kernel`.
+- **Portable**: `Export` downloads the notebook as a `.ipynb` (nbformat 4.5, with execution counts
+  and outputs); `Import` replaces it with a file you pick. The conversion is documented as lossy —
+  raw cells become markdown, output types the panel cannot draw are dropped, oversized images and
+  markup fall back or are dropped — but every such loss is reported in a line under the toolbar
+  instead of happening quietly.
 
 **The panel and the agent share one kernel and one notebook.** A variable defined in a cell is
 visible to `jupyter_execute` and vice versa, in both directions and immediately — there is no
@@ -310,12 +326,13 @@ jupyter server --no-browser --port=9004 \
 Then:
 
 ```bash
-npm test                 # the four offline suites; JUPYTER_TEST_URL adds e2e and register
+npm test                 # the five offline suites; JUPYTER_TEST_URL adds e2e and register
 npm run test:offline     # same, explicitly without a server
 
 node test/e2e.mjs        # protocol and runtime: auth, execute, persistence, timeout, kernel lifecycle
 node test/register.mjs   # mounts the plugin in a real cordis context with the real dsh-tools registry
-node test/notebook.mjs   # the panel model, its routes, streaming, agent cells, the snapshot tool's data
+node test/notebook.mjs   # the panel model, its routes, streaming, agent cells, run-all, import
+node test/ipynb.mjs      # .ipynb both ways: line arrays, images, budgets, and what gets dropped
 node test/activity.mjs   # activity notes: wording, batching, outline, and the pre-step delivery guards
 node test/client.mjs     # the browser bundle: registrations, render paths, clicks, stream patches
 node test/transport.mjs  # DNS cache, socket reuse, Host header, and the WebSocket frame codec
@@ -346,8 +363,13 @@ Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PAS
 - **The panel is a notebook, not JupyterLab.** JupyterLab sends `Content-Security-Policy:
   frame-ancestors 'self'`, so it cannot be framed in the Harness UI; the panel is a native
   reimplementation of the notebook surface instead. It supports code and markdown cells with add,
-  edit, delete, run, reorder and type switching — no completion, no variable inspector, no `.ipynb`
-  import or export yet.
+  edit, delete, insert, run, run-all, reorder and type switching — no completion, no variable
+  inspector, no debugger.
+- **`.ipynb` import and export are lossy.** Reading and writing notebook files works, but the panel
+  holds a subset of the format: raw cells are imported as markdown, output types it cannot draw and
+  images over 2 MiB are dropped, `text/html` over 256 KiB becomes plain text, and a document is
+  capped at 500 cells. Every loss is reported; the file is not byte-identical to what JupyterLab
+  would write.
 - **Output support is a chosen subset.** Images, `text/html`, `text/markdown` and text are rendered;
   `application/json`, LaTeX and arbitrary MIME types are not (a `display_data` carrying only those
   names its MIME types instead of drawing them). HTML is sanitized rather than trusted, so an output
