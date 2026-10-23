@@ -283,7 +283,7 @@ await check('it registers both dictionaries with every key the UI asks for', () 
   assert.equal(page.registered.locales[0].ns, 'jupyterlab')
   assert.deepEqual(Object.keys(page.registered.locales[0].dicts).sort(), ['en', 'zh'])
   const english = page.registered.locales[0].dicts.en
-  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss']) {
+  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss', 'cellLabel', 'outputLabel', 'toCode', 'toMarkdown', 'editorHint']) {
     assert.equal(typeof english[key], 'string', `missing translation "${key}"`)
   }
 })
@@ -993,6 +993,204 @@ await check('tokenizing preserves every character of a tricky snippet', () => {
     const rendered = renderCell(page, cellOf({ source }))
     const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
     assert.equal(textOf(pre), source, `tokenizing changed ${JSON.stringify(source)}`)
+  }
+})
+
+console.log('\nlanguage, keyboard, and landmarks')
+
+/** Render one cell through the panel's own path, with a view whose kernel decides the language. */
+function renderCellIn(page, cell = cellOf(), options = {}) {
+  const Notebook = page.component('sidebar.right.pane.tab')
+  page.React.reset()
+  page.slots.length = 0
+  page.slots[0] = viewOf([cell], options.view ?? {})
+  const tree = Notebook({ sessionId: 's-lang', t: (key) => key, ...(options.channel ?? {}) })
+  const node = findComponent(tree, (props) => props.cell?.id === cell.id)
+  assert.ok(node !== undefined, 'the cell element must appear in the panel tree')
+  page.React.reset()
+  return node.type({ ...node.props, ...(options.props ?? {}) })
+}
+
+/** Render a cell with its editor open, without going through the double-click. */
+function renderEditing(page, options = {}) {
+  const cell = options.cell ?? cellOf({ source: 'x = 1' })
+  return renderCellIn(page, cell, {
+    ...options,
+    props: { editing: cell.id, draft: options.draft ?? cell.source, ...(options.props ?? {}) },
+  })
+}
+
+/** The one textarea of an editing cell. */
+function editorOf(tree) {
+  const areas = findAll(tree, 'textarea')
+  assert.equal(areas.length, 1, 'an editing cell has exactly one editor')
+  return areas[0]
+}
+
+/** Press one key on an editor, with a cursor selection. */
+function press(area, key, options = {}) {
+  const prevented = []
+  area.props.onKeyDown({
+    key,
+    shiftKey: options.shiftKey ?? false,
+    metaKey: options.metaKey ?? false,
+    ctrlKey: options.ctrlKey ?? false,
+    altKey: false,
+    isComposing: options.isComposing ?? false,
+    preventDefault: () => prevented.push(key),
+    target: { selectionStart: options.start ?? 0, selectionEnd: options.end ?? options.start ?? 0 },
+  })
+  return prevented
+}
+
+await check('an R kernel is coloured with R grammar, not with Python keywords', () => {
+  const cell = cellOf({ source: 'f <- function(x) { if (x) TRUE else FALSE }  # note' })
+  const rendered = renderCellIn(page, cell, { view: { kernel: { id: 'k1', name: 'ir', state: 'idle' } } })
+  const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+  assert.equal(textOf(pre), cell.source, 'highlighting must not alter what the cell says')
+  const spans = findAll(pre, 'span')
+  const keywords = spans.filter((node) => node.props.className === 'dshj-t-kw').map(textOf)
+  for (const word of ['function', 'if', 'else', 'TRUE', 'FALSE']) {
+    assert.ok(keywords.includes(word), `R keyword ${word} missing from ${keywords.join('|')}`)
+  }
+  assert.ok(!keywords.includes('def'), 'Python keywords must not appear in an R cell')
+  assert.deepEqual(spans.filter((node) => node.props.className === 'dshj-t-op' && textOf(node) === '<-').length, 1)
+  assert.deepEqual(spans.filter((node) => node.props.className === 'dshj-t-com').map(textOf), ['# note'])
+  assert.equal(textOf(flatten(rendered).find((node) => node.props?.className === 'dshj-kind')), 'R')
+})
+
+await check('a Julia kernel gets Julia comments, including the block form', () => {
+  const cell = cellOf({ source: 'function area(r)\n  #= circle =#\n  r .^ 2\nend' })
+  const rendered = renderCellIn(page, cell, { view: { kernel: { id: 'k2', name: 'julia-1.10', state: 'idle' } } })
+  const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+  assert.equal(textOf(pre), cell.source)
+  const spans = findAll(pre, 'span')
+  assert.deepEqual(spans.filter((node) => node.props.className === 'dshj-t-com').map(textOf), ['#= circle =#'])
+  const keywords = spans.filter((node) => node.props.className === 'dshj-t-kw').map(textOf)
+  assert.deepEqual(keywords, ['function', 'end'])
+  assert.equal(textOf(flatten(rendered).find((node) => node.props?.className === 'dshj-kind')), 'Jl')
+})
+
+await check('a kernel nobody wrote a tokenizer for is shown, not guessed at', () => {
+  const source = 'def f(x: Int) = x + 1'
+  const rendered = renderCellIn(page, cellOf({ source }), { view: { kernel: { id: 'k3', name: 'scala212', state: 'idle' } } })
+  const pre = findAll(rendered, 'pre').find((node) => node.props.className === 'dshj-source')
+  assert.equal(textOf(pre), source)
+  assert.equal(findAll(pre, 'span').length, 0, 'an unknown language is rendered as plain text')
+  assert.equal(textOf(flatten(rendered).find((node) => node.props?.className === 'dshj-kind')), '<>')
+})
+
+await check('Tab indents the line instead of leaving the editor', () => {
+  const drafts = []
+  const area = editorOf(renderEditing(page, { cell: cellOf({ source: 'x = 1' }), props: { onDraft: (value) => drafts.push(value) } }))
+  const prevented = press(area, 'Tab', { start: 0 })
+  assert.deepEqual(prevented, ['Tab'], 'the browser must not move focus')
+  assert.deepEqual(drafts, ['  x = 1'])
+})
+
+await check('Shift+Tab outdents, one level at a time', () => {
+  const drafts = []
+  const area = editorOf(renderEditing(page, { cell: cellOf({ source: '    x = 1' }), props: { onDraft: (value) => drafts.push(value) } }))
+  press(area, 'Tab', { shiftKey: true, start: 6 })
+  assert.deepEqual(drafts, ['  x = 1'])
+})
+
+await check('a selection indents every line it touches', () => {
+  const drafts = []
+  const source = 'a = 1\nb = 2'
+  const area = editorOf(renderEditing(page, { cell: cellOf({ source }), props: { onDraft: (value) => drafts.push(value) } }))
+  press(area, 'Tab', { start: 0, end: source.length })
+  assert.deepEqual(drafts, ['  a = 1\n  b = 2'])
+})
+
+await check('Enter carries the indentation, and opens one level after a colon', () => {
+  const drafts = []
+  const opener = editorOf(renderEditing(page, { cell: cellOf({ source: 'if x:' }), props: { onDraft: (value) => drafts.push(value) } }))
+  press(opener, 'Enter', { start: 5 })
+  const nested = editorOf(renderEditing(page, { cell: cellOf({ source: '    if x:' }), props: { onDraft: (value) => drafts.push(value) } }))
+  press(nested, 'Enter', { start: 9 })
+  const plain = editorOf(renderEditing(page, { cell: cellOf({ source: 'x = 1' }), props: { onDraft: (value) => drafts.push(value) } }))
+  press(plain, 'Enter', { start: 5 })
+  assert.deepEqual(drafts, ['if x:\n  ', '    if x:\n      ', 'x = 1\n'])
+})
+
+await check('prose does not open a block at a colon', () => {
+  const drafts = []
+  const area = editorOf(renderEditing(page, {
+    cell: cellOf({ kind: 'markdown', source: 'Note:' }),
+    draft: 'Note:',
+    props: { onDraft: (value) => drafts.push(value) },
+  }))
+  press(area, 'Enter', { start: 5 })
+  assert.deepEqual(drafts, ['Note:\n'], 'a markdown cell indents, it does not nest')
+})
+
+await check('Ctrl+Enter runs in place, Shift+Enter runs and leaves', () => {
+  const runs = []
+  const area = editorOf(renderEditing(page, { props: { onRun: (id, source, options) => runs.push({ id, source, options }) } }))
+  press(area, 'Enter', { ctrlKey: true, start: 5 })
+  press(area, 'Enter', { shiftKey: true, start: 5 })
+  assert.deepEqual(runs.map((call) => call.id), ['c1', 'c1'])
+  assert.equal(runs[0].options.keepEditing, true, 'Ctrl+Enter keeps the editor open')
+  assert.equal(runs[1].options.keepEditing, false, 'Shift+Enter closes it')
+})
+
+await check('Ctrl+S saves without running or leaving', () => {
+  const commits = []
+  const runs = []
+  const area = editorOf(renderEditing(page, {
+    props: {
+      onCommit: (id, source, options) => commits.push({ id, source, options }),
+      onRun: () => runs.push(1),
+    },
+  }))
+  press(area, 's', { ctrlKey: true })
+  assert.equal(commits.length, 1)
+  assert.equal(commits[0].source, 'x = 1')
+  assert.equal(commits[0].options.keepEditing, true)
+  assert.deepEqual(runs, [], 'saving must not run the cell')
+})
+
+await check('an IME owns the keyboard while it is composing', () => {
+  const drafts = []
+  const runs = []
+  const area = editorOf(renderEditing(page, {
+    props: { onDraft: (value) => drafts.push(value), onRun: () => runs.push(1) },
+  }))
+  press(area, 'Enter', { isComposing: true, start: 5 })
+  press(area, 'Tab', { isComposing: true, start: 5 })
+  assert.deepEqual(drafts, [])
+  assert.deepEqual(runs, [])
+})
+
+await check('a cell is a labelled list item, and its output is a group', () => {
+  const rendered = renderCell(page, cellOf({ outputs: [{ type: 'text', text: '1' }], error: 'boom' }))
+  assert.equal(rendered.props.role, 'listitem')
+  assert.equal(rendered.props['aria-label'], 'cellLabel 1')
+  assert.equal(rendered.props.tabIndex, -1, 'focus can return to the cell that just closed')
+  assert.equal(rendered.props['aria-busy'], 'false')
+  const out = flatten(rendered).find((node) => node.props?.className === 'dshj-out')
+  assert.equal(out.props.role, 'group')
+  assert.equal(out.props['aria-label'], 'outputLabel')
+  const banner = flatten(rendered).find((node) => node.props?.className === 'dshj-err')
+  assert.equal(banner.props.role, 'alert')
+  const running = renderCell(page, cellOf({ status: 'running' }))
+  assert.equal(running.props['aria-busy'], 'true')
+  const status = flatten(running).find((node) => node.props?.className === 'dshj-running')
+  assert.equal(status.props.role, 'status', 'a screen reader should hear that the cell started')
+})
+
+await check('the panel announces itself and its list of cells', async () => {
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 140 }))
+  try {
+    const tree = panelTree({ sessionId: 's-a11y', t: (key) => key })
+    const root = flatten(tree).find((node) => node.props?.className === 'dshj-root')
+    assert.equal(root.props.role, 'region')
+    assert.equal(root.props['aria-label'], 'title')
+    const list = flatten(tree).find((node) => node.props?.className === 'dshj-cells')
+    assert.equal(list.props.role, 'list')
+  } finally {
+    fetchState.restore()
   }
 })
 
