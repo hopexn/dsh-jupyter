@@ -15,7 +15,8 @@ dependencies beyond the packages DSH itself ships.
 | --- | --- |
 | `jupyter_connect` | Point the harness at a JupyterLab address and verify the credentials. Normalizes `/lab`, `/tree` and `?token=...`; reports the server version, kernelspecs and running kernels. |
 | `jupyter_status` | Connection, server version, kernelspecs, running kernels, and which kernel this conversation is bound to. |
-| `jupyter_execute` | Run code in the session's kernel; returns stdout, the value of the last expression, stderr, tracebacks, and paths of saved image/PDF outputs. |
+| `jupyter_execute` | Run code in the session's kernel; returns stdout, the value of the last expression, stderr, tracebacks, and paths of saved image/PDF outputs. The run is also recorded as a cell in the panel, marked `Agent`. |
+| `jupyter_notebook` | Read the notebook in the panel (cells, source, outputs, execution counts) and `add`, `update`, `delete` or `run` one of its cells. `ifRevision` refuses an edit based on a version the model did not see. |
 | `jupyter_kernel` | `list`, `start`, `restart`, `interrupt`, `shutdown`, or `attach` to a kernel that already exists on the server. |
 
 Sessions are bound per DeepSeek Harness conversation, so two chats do not share a namespace. The
@@ -51,17 +52,22 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
 - **Told to the agent**: an edit, a run (with its outcome and the tail of what it printed), a
   deletion, a cleared output — each is queued for the model and delivered with its next step as a
   context note attributed to this plugin, not as something the user typed. The header shows how
-  many notes are waiting (`2 queued`). A run's start is replaced by its result, so the model sees
-  one accurate note per cell rather than a stream of them.
-- **Live**: while the panel is visible it also polls the host, carrying the revision it already has,
-  so a cell the agent ran in the shared kernel appears without a click. When nothing changed the
-  answer is two fields and never reaches Jupyter.
+  many notes are waiting (`2 queued`); clicking that badge lists exactly what will be sent and
+  offers to discard it. A run's start is replaced by its result, so the model sees one accurate
+  note per cell rather than a stream of them. The first batch of a session also carries a
+  one-line-per-cell map, so a note can say "cell 3" to a model that has not seen the notebook yet.
+- **Live**: while the panel is visible it also polls the host, carrying the revision it already has.
+  A run the agent performs in the shared kernel appears as a cell of its own, marked `Agent`, so
+  the notebook is a record of the whole analysis rather than the user's half of it. When nothing
+  changed the answer is two fields and never reaches Jupyter.
 - **Kernel**: the header shows the bound kernel and offers `Interrupt` and `Restart kernel`.
 
-**The panel and the agent share one kernel.** A variable defined in a cell is visible to
-`jupyter_execute` and vice versa, in both directions and immediately — there is no separate
-"notebook kernel". Concurrency is handled by the same per-kernel queue, so a cell you run while the
-agent is executing simply waits its turn.
+**The panel and the agent share one kernel and one notebook.** A variable defined in a cell is
+visible to `jupyter_execute` and vice versa, in both directions and immediately — there is no
+separate "notebook kernel". Concurrency is handled by the same per-kernel queue, so a cell you run
+while the agent is executing simply waits its turn. The agent can also read and edit the cells you
+wrote with `jupyter_notebook`, which is what makes "fix cell 3" a request it can act on instead of
+guess at.
 
 Cells are mirrored to `$DSH_HOME/jupyterlab/notebooks/<session>.json`, so a page reload or an app
 restart restores them.
@@ -304,10 +310,13 @@ jupyter server --no-browser --port=9004 \
 Then:
 
 ```bash
+npm test                 # the four offline suites; JUPYTER_TEST_URL adds e2e and register
+npm run test:offline     # same, explicitly without a server
+
 node test/e2e.mjs        # protocol and runtime: auth, execute, persistence, timeout, kernel lifecycle
 node test/register.mjs   # mounts the plugin in a real cordis context with the real dsh-tools registry
-node test/notebook.mjs   # the panel's model, its three routes, streaming events and the asset store
-node test/activity.mjs   # activity notes: wording, batching, and the agent/pre-step delivery guards
+node test/notebook.mjs   # the panel model, its routes, streaming, agent cells, the snapshot tool's data
+node test/activity.mjs   # activity notes: wording, batching, outline, and the pre-step delivery guards
 node test/client.mjs     # the browser bundle: registrations, render paths, clicks, stream patches
 node test/transport.mjs  # DNS cache, socket reuse, Host header, and the WebSocket frame codec
 

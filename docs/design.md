@@ -14,7 +14,9 @@
 
 | 想改的东西 | 先读 | 主要文件 / 符号 | 对应测试 |
 | --- | --- | --- | --- |
-| 工具的参数、返回值、提示语 | §2.1 | `lib/index.js`: `connectTool` `statusTool` `executeTool` `kernelTool` `PROMPT_TEXT` | `test/register.mjs` |
+| 工具的参数、返回值、提示语 | §2.1 | `lib/index.js`: `connectTool` `statusTool` `executeTool` `notebookTool` `kernelTool` `PROMPT_TEXT` | `test/register.mjs` |
+| 模型读/改面板里的单元格 | §2.1 §4.1 | `lib/index.js`: `notebookTool`；`lib/notebook.js`: `snapshot` `runCellNow` | `test/register.mjs` `test/notebook.mjs` |
+| agent 执行如何出现在面板里 | §2.4 | `lib/notebook.js`: `beginAgentRun` `#settle` | `test/notebook.mjs` |
 | 连接地址、token/密码、URL 归一化 | §5.2 | `lib/server.js`: `normalizeJupyterUrl` `JupyterServerClient` | `test/e2e.mjs` |
 | 内核绑定、重连、绑定落盘 | §3.1 | `lib/runtime.js`: `JupyterRuntime` `sessionKernel` `ensureKernel` | `test/e2e.mjs` |
 | 执行协议（execute_request / iopub / 中断） | §2.2 | `lib/kernel.js`: `KernelConnection.execute` `#runOne` | `test/e2e.mjs` |
@@ -89,6 +91,13 @@ index.executeTool
   产出的部分，`status` 记为 `timeout` / `aborted`；变量不丢。
 - **产物按 MIME 落盘**：`ARTIFACT_MIME_EXTENSIONS` 里的六种（png/jpg/gif/webp/svg/pdf），
   base64 与 UTF-8 分开写。
+- **每次执行都留一个单元格。** `notebooks.beginAgentRun` 在发代码前插入 `origin: 'agent'` 的格子，
+  `onOutput` 把 iopub 直接推进面板（与用户点 Run 同一套补丁），结束时 `#settle` 用权威输出重算。
+  没有 agent 会话的调用（`sessionKey` 落到 `shared`）不写面板。
+- **`jupyter_notebook` 是另一半。** 它读的是**面板的模型**，不是内核历史：`snapshot` 给出格号、
+  id、`rev`、源码与输出摘要；`add/update/delete` 走 `command(..., { note: false })`，`run` 走
+  `runCellNow`（同一个 `#beginCodeRun`，等结果而不是立即返回）。模型自己的动作**不产生用户 note**，
+  否则下一轮它会读到自己刚做的事被描述成用户的编辑。
 
 ### 2.2 面板侧：`Run`
 
@@ -128,8 +137,27 @@ client onRun ─ POST {action:'runCell', id, source}
   note，因为它描述的单元格已经不存在；`moveCell`、`setPath` 不产生 note。
 - **预算。** 每会话最多 8 条 / 6000 字符；单条源码 900 字符、输出 800 字符；超了丢最旧的，
   单条超长在消息里截断。
+- **第一批发地图。** 会话第一次交付 note 时，`Notebooks.outline` 生成一行一格的大纲（格号、
+  kind、origin、`Out[n]`、首行），否则"cell 3"对从没看过笔记本的模型是悬空的。之后不再重复；
+  `reset` 让 revision 归零，下一次重新发。`list()` 只读不消费，供面板预览。
 - **不写会话日志。** 这里不直接 `session.append`：交付时机和"这一轮到底发不发"由 `agent` 决定，
   绕过它会让一条 note 凭空开出一轮对话。
+
+### 2.4 第四条链路：模型 → 面板
+
+```
+jupyter_execute
+  └─ notebooks.beginAgentRun → 插入 origin:'agent' 的格子（SSE insert）
+       └─ onOutput → OutputRenderer → append/text（与用户运行同一套）
+            └─ finish → renderableOutputs → 权威 cell 事件
+```
+
+- **反向同步是补齐记录，不是装饰。** 面板和 agent 共用一个内核；只记用户那一半，笔记本就会
+  缺掉模型改过的状态。`origin` 只影响显示（格子头部的 `Agent` 徽标），不影响执行。
+- **插入事件只有一种。** `insert` 带 `index` 与完整 cell；客户端按位置插入，重复 id 则替换。
+  普通 `cell` 事件仍然只更新已存在的格子——一个已被删除的格子不该被它的收尾事件重新加回来。
+- **工具自己的动作不改用户上下文。** `jupyter_notebook` 的增删改运行都传 `{ note: false }`；
+  模型需要的是这次工具调用的返回值，不是下一轮的一条"用户编辑了…"。
 
 ---
 
@@ -168,9 +196,9 @@ client onRun ─ POST {action:'runCell', id, source}
   客户端才需要换掉那个单元格对象，`React.memo` 才拦得住兄弟节点。
 
 **视图是浅拷贝。** `view()` 对每个 cell 做 `{...cell}` 而不是深拷贝：路由紧接着 JSON 序列化，
-深拷贝只会把 base64 图再复制一遍。`view()` 只在有待发 note 时带 `pendingNotes`（头部徽标用的
-计数）；`?since=<revision>` 命中时返回 `{sessionId, revision, unchanged: true, pendingNotes}`，
-不碰 Jupyter——note 被取走后 revision 不变，徽标只能靠这个字段归零。
+深拷贝只会把 base64 图再复制一遍。`view()` 只在有待发 note 时带 `pendingNotes`（头部徽标的计数）
+与 `notes`（`[{key, summary}]`，点开徽标看的就是它）；`?since=<revision>` 命中时同样带这两个
+字段，不碰 Jupyter——note 被取走后 revision 不变，徽标与列表只能靠这个短答案归零。
 
 **落盘。** `isHeavy()` 只看长度不序列化；轻的立即写，重的延迟 60 ms 合并写；跑之前和
 `dispose()` 强制落盘。写文件是 `tmp + rename`，紧凑 JSON（缩进对大 payload 是纯浪费）。
@@ -179,12 +207,13 @@ client onRun ─ POST {action:'runCell', id, source}
 
 | `type` | 载荷 | 用途 |
 | --- | --- | --- |
+| `insert` | `revision` + `index` + 完整 cell | 新格子出现（模型运行）；客户端按位置插入，重复 id 替换 |
 | `cell` | `revision` + 完整 cell | 开始/结束的权威状态；不合并，立即下发 |
 | `append` | `cellId` + 一条 output | 新增输出（text/html/markdown/image/error） |
 | `text` | `cellId` + `index` + `text` | 向第 index 条输出追加文本 |
 | `clear` | `cellId` | 内核 `clear_output` |
 
-`append` / `text` 按 60 ms 合并成帧；`cell` 立即发，否则状态行会滞后于输出。
+`append` / `text` 按 60 ms 合并成帧；`cell` 与 `insert` 立即发，否则列表和状态行会滞后于输出。
 
 ---
 
@@ -194,7 +223,7 @@ client onRun ─ POST {action:'runCell', id, source}
 
 | action | 效果 | 备注 |
 | --- | --- | --- |
-| `addCell` | 在 `afterId` 之后插入，缺省追加到末尾 | `kind` 缺省 code |
+| `addCell` | 在 `afterId` 之后插入，缺省追加到末尾 | `kind` 缺省 code；`origin` 只有工具会传 |
 | `updateCell` | 改 `source` / `kind` | 切到 markdown 时清空输出与执行计数 |
 | `deleteCell` | 删除；删空后补一个空 code 格 | 不允许零单元格 |
 | `moveCell` | 与相邻格交换（`delta: ±1`） | 越界静默 |
@@ -202,6 +231,7 @@ client onRun ─ POST {action:'runCell', id, source}
 | `clearAllOutputs` | 清全部 | |
 | `runCell` | 保存草稿并执行（markdown 直接渲染） | 立即返回，输出走 SSE |
 | `startKernel` / `interrupt` / `restartKernel` | 内核生命周期 | 结果塞进 `message` |
+| `discardNotes` | 丢弃待交给模型的 note | 不改 revision，只清缓冲 |
 | `setPath` | 设置笔记本路径 | 尚未用于读写 `.ipynb` |
 | `reset` | 丢弃内存与镜像 | 测试与"新建"用 |
 
@@ -273,7 +303,12 @@ dataUrl}`），客户端两种都认。
 `HtmlOutput` / `Markdown`。`OpenButton` 是 composer 工具行里的入口，`NotebookTitle` 是侧栏标题。
 
 `pendingNotes` 是唯一一个不随 `revision` 变的视图字段：头部徽标读它，轮询的 `unchanged` 答案
-也带它（见 §3.2）。徽标只在大于 0 时出现，否则工具栏会一直多一个空壳。
+也带它（见 §3.2）。徽标只在大于 0 时出现，否则工具栏会一直多一个空壳；它是个按钮，点开列出
+`notes` 的 summary 并可以丢弃——用户有权知道模型到底会看到什么。
+
+`adopt(next)` 会拒绝比 `panelRevisions` 更旧的完整视图：GET 和 SSE 走两条连接，慢 GET 可能
+在更新的流事件之后到达，否则会把面板倒回去。`origin: 'agent'` 的格子只在头部多一个 `Agent`
+徽标，其余行为与用户格子完全一致。
 
 三条与性能有关的约定，改 UI 时要保住：
 
@@ -357,7 +392,7 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 
 | 文件 | 职责 | 关键导出 |
 | --- | --- | --- |
-| `lib/index.js` | Cordis 插件：Config、系统提示、四个工具、接线 | `apply` `Config` |
+| `lib/index.js` | Cordis 插件：Config、系统提示、五个工具、接线 | `apply` `Config` |
 | `lib/runtime.js` | 连接与会话内核状态：绑定、重连、镜像 | `JupyterRuntime` `normalizeSettings` |
 | `lib/server.js` | REST 客户端：URL、认证、XSRF、cookie | `JupyterServerClient` `normalizeJupyterUrl` `JupyterError` |
 | `lib/transport.js` | 出站 HTTP（keep-alive、缓冲、abort） | `httpRequest` `combineSignals` |
@@ -397,6 +432,10 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 - `jupyter_execute` 不流式：模型一次拿全结果更省轮次；长任务的进度看面板。
 - 面板活动是**下一步的上下文**，不是即时消息：agent 空闲时编辑只会让徽标加一，真正交付发生在
   下一次请求；已经在飞的请求不会被改写。
+- **每次 `jupyter_execute` 都会在面板留一个 `Agent` 格子**，包括失败与超时。它是这份分析记录的
+  一部分；代价是一次探索很长的会话会让笔记本变长，暂时不做折叠或清理。
+- `jupyter_notebook` 的 `run` 会等结果（工具调用需要一个答案），而面板的 `Run` 立即返回
+  （用户需要看到输出在长跑时流出来）。同一个 `#beginCodeRun`，两种等待策略。
 - 一个大内核一个会话绑定；跨会话共享内核属于能力扩展，不在当前范围。
 - 虚拟滚动没做：`memo` 之后每帧只重渲染一格，收益不足以引入行高测量与滚动同步。
 
