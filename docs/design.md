@@ -17,6 +17,7 @@
 | 工具的参数、返回值、提示语 | §2.1 | `lib/index.js`: `connectTool` `statusTool` `executeTool` `notebookTool` `kernelTool` `PROMPT_TEXT` | `test/register.mjs` |
 | 模型读/改面板里的单元格 | §2.1 §4.1 | `lib/index.js`: `notebookTool`；`lib/notebook.js`: `snapshot` `runCellNow` | `test/register.mjs` `test/notebook.mjs` |
 | agent 执行如何出现在面板里 | §2.4 | `lib/notebook.js`: `beginAgentRun` `#settle` | `test/notebook.mjs` |
+| 模型改写单元格后的 diff | §3.2 §4.6 | `lib/notebook.js`: `previousSource` `revertCell`；`lib/client.js`: `diffRows` | `test/notebook.mjs` `test/client.mjs` |
 | 连接地址、token/密码、URL 归一化 | §5.2 | `lib/server.js`: `normalizeJupyterUrl` `JupyterServerClient` | `test/e2e.mjs` |
 | 内核绑定、重连、绑定落盘 | §3.1 | `lib/runtime.js`: `JupyterRuntime` `sessionKernel` `ensureKernel` | `test/e2e.mjs` |
 | 执行协议（execute_request / iopub / 中断） | §2.2 | `lib/kernel.js`: `KernelConnection.execute` `#runOne` | `test/e2e.mjs` |
@@ -195,8 +196,14 @@ jupyter_execute
 | `#runs` | 会话 → 在飞的 Promise 集合 | `idle()` / `dispose()` 等它 |
 | `#runningAll` | 会话 → `{stop}` | 全量运行的停止标志；`dispose()` 会把它们全部置位 |
 
-单元格结构（`CellView`）：`id` `kind` `source` `rev` `status` `executionCount` `durationMs`
-`outputs` `error`。
+单元格结构（`CellView`）：`id` `kind` `source` `previousSource` `rev` `status` `executionCount`
+`durationMs` `outputs` `error`。
+
+**`previousSource` 是模型改写的痕迹。** `jupyter_notebook` 的 `update` 带 `origin: 'agent'`，
+宿主把被替换的源码留在 `previousSource` 里，面板据此显示"有改动"徽标与行级 diff。用户自己
+的一次编辑、`dismissDiff`（接受）、`revertCell`（还原）都会清掉它——用户动过的文本就是新基线。
+它是**面板状态**，不进 `snapshot()`：给模型的摘要里多一个"你上次改了什么"的字段只会让它
+反复回看，而真正要紧的是当前源码。
 
 **`revision` 与 `rev` 不是一回事：**
 
@@ -238,7 +245,9 @@ jupyter_execute
 | action | 效果 | 备注 |
 | --- | --- | --- |
 | `addCell` | 在 `afterId` 之后插入，缺省追加到末尾 | `kind` 缺省 code；`origin` 只有工具会传 |
-| `updateCell` | 改 `source` / `kind` | 切到 markdown 时清空输出与执行计数 |
+| `updateCell` | 改 `source` / `kind` | 切到 markdown 时清空输出与执行计数；`origin:'agent'` 时把旧源码留在 `previousSource` |
+| `dismissDiff` | 接受模型的改写 | 只清 `previousSource`，源码不动 |
+| `revertCell` | 还原到 `previousSource` | 一条命令完成撤销；没有旧版本时报错；会作为用户编辑产生 note |
 | `deleteCell` | 删除；删空后补一个空 code 格 | 不允许零单元格 |
 | `moveCell` | 与相邻格交换（`delta: ±1`） | 越界静默 |
 | `clearOutput` | 清一个格子的输出 | |
@@ -363,6 +372,10 @@ dataUrl}`），客户端两种都认。
   调用，所以输出在运行中越过阈值时组件不会重挂、已展开的不会被折回去。
 - **`+` 是插入点。** 每一格的工具栏都有 `addCell` + `afterId`：分析是自上而下读的，新想法
   通常属于刚刚触发它的那一格的正下方，而不是整本的末尾。
+- **模型改写单元格是可见的。** `jupyter_notebook update` 换掉一段用户写的代码时，面板头部多一个
+  `有改动` 徽标；点开是行级 diff（先裁掉相同的头尾，再用 LCS 表格；比较规模超过阈值就直接
+  分块列出，别为一次渲染算一张大表）。两个出口各是一条命令：`dismissDiff` 接受，
+  `revertCell` 还原——撤销不该由客户端拼成"再发一次 update"，否则宿主会把它记成又一次改写。
 - **`message` 是给用户的一句话。** 内核动作和导入的告警都通过它回到面板（关闭按钮清掉），
   不写进 `error`：那些不是错误，用红色横幅表示会误导。
 - **原地运行时草稿不能立刻丢。** `Ctrl/Cmd+Enter` 让编辑器留着，而草稿一旦在这里删掉，`draft`

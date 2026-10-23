@@ -79,6 +79,9 @@ notebook/ipynb/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器
 11. **高亮的语言来自内核，不来自笔记本。** `languageFor` 只认 Python/R/Julia，其余一律
     `plain`（纯文本、不产生 span）。给未知内核套 Python 关键词比不上色更糟：错的语法会被当成
     对的学。同理，编辑器的键位改动要保住 `Tab` 的 `preventDefault` 与 IME 的 `isComposing` 早退。
+12. **模型改写单元格必须带 `origin: 'agent'`。** 宿主靠它把旧源码留在 `previousSource`，面板才有
+    diff 与撤销；丢掉这个字段，`jupyter_notebook update` 就变成悄悄换掉用户代码。客户端也不能把
+    撤销拼成"再发一次 `updateCell`"——那是又一次模型改写，`revertCell` 才是撤销。
 
 ## 验证
 

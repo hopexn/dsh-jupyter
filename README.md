@@ -16,7 +16,7 @@ dependencies beyond the packages DSH itself ships.
 | `jupyter_connect` | Point the harness at a JupyterLab address and verify the credentials. Normalizes `/lab`, `/tree` and `?token=...`; reports the server version, kernelspecs and running kernels. |
 | `jupyter_status` | Connection, server version, kernelspecs, running kernels, and which kernel this conversation is bound to. |
 | `jupyter_execute` | Run code in the session's kernel; returns stdout, the value of the last expression, stderr, tracebacks, and paths of saved image/PDF outputs. The run is also recorded as a cell in the panel, marked `Agent`. |
-| `jupyter_notebook` | Read the notebook in the panel (cells, source, outputs, execution counts) and `add`, `update`, `delete` or `run` one of its cells. `ifRevision` refuses an edit based on a version the model did not see. |
+| `jupyter_notebook` | Read the notebook in the panel (cells, source, outputs, execution counts) and `add`, `update`, `delete` or `run` one of its cells. `ifRevision` refuses an edit based on a version the model did not see; an `update` leaves a reviewable diff in the panel rather than silently replacing your code. |
 | `jupyter_kernel` | `list`, `start`, `restart`, `interrupt`, `shutdown`, or `attach` to a kernel that already exists on the server. |
 
 Sessions are bound per DeepSeek Harness conversation, so two chats do not share a namespace. The
@@ -78,6 +78,10 @@ The plugin also puts a notebook in the **right sidebar**, beside the conversatio
   A run the agent performs in the shared kernel appears as a cell of its own, marked `Agent`, so
   the notebook is a record of the whole analysis rather than the user's half of it. When nothing
   changed the answer is two fields and never reaches Jupyter.
+- **Reviewable edits**: when the agent rewrites a cell you wrote (`jupyter_notebook` `update`), the
+  cell gets a `Changed` chip instead of quietly becoming different code. Opening it shows a line
+  diff of what was replaced; `Keep` accepts it, `Undo` restores your version in one command. Your
+  own edit is the new baseline and clears the marker.
 - **Kernel**: the header shows the bound kernel and offers `Interrupt` and `Restart kernel`.
 - **Portable**: `Export` downloads the notebook as a `.ipynb` (nbformat 4.5, with execution counts
   and outputs); `Import` replaces it with a file you pick. The conversion is documented as lossy —
