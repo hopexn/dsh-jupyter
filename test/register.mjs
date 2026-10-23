@@ -16,10 +16,16 @@
  */
 
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
+
+// Keep the test out of the developer's real `~/.dsh`: the notebook tool writes a mirror, and a
+// test run must not add cells to the notebook they are using.
+process.env.DSH_HOME ??= mkdtempSync(path.join(tmpdir(), 'dsh-jupyter-register-'))
 
 import * as plugin from '../lib/index.js'
 
@@ -150,8 +156,8 @@ await check('the plugin mounts into a live runtime', async () => {
   await tick()
   await tick()
 })
-await check('all four tools are visible to the model', () => {
-  for (const name of ['jupyter_connect', 'jupyter_status', 'jupyter_execute', 'jupyter_kernel']) {
+await check('all five tools are visible to the model', () => {
+  for (const name of ['jupyter_connect', 'jupyter_status', 'jupyter_execute', 'jupyter_notebook', 'jupyter_kernel']) {
     assert.notEqual(ctx.tools.get(name), undefined, `${name} was not registered`)
   }
 })
@@ -167,6 +173,11 @@ await check('the execute tool exposes its parameters and hides its timeout budge
 await check('the kernel tool constrains its action to the supported set', () => {
   const schema = ctx.tools.schemas().find((entry) => entry.name === 'jupyter_kernel')
   assert.deepEqual(schema.parameters.properties.action.enum, ['list', 'start', 'restart', 'interrupt', 'shutdown', 'attach'])
+})
+await check('the notebook tool publishes its five actions', () => {
+  const schema = ctx.tools.schemas().find((entry) => entry.name === 'jupyter_notebook')
+  assert.deepEqual(schema.parameters.properties.action.enum, ['read', 'add', 'update', 'delete', 'run'])
+  assert.deepEqual(schema.parameters.required, ['action'])
 })
 await check('the plugin contributed system-prompt guidance', () => {
   const prompt = ctx.get('systemPrompt')
@@ -201,6 +212,42 @@ await check('a failing cell is reported as an error result, not a crash', async 
   const text = textOf(result)
   assert.match(text, /^error · /, text)
   assert.match(text, /RuntimeError: tool-level boom/)
+})
+await check('jupyter_notebook starts empty and adds a cell', async () => {
+  const empty = await callTool(ctx, 'jupyter_notebook', { action: 'read' })
+  assert.notEqual(empty.isError, true, textOf(empty))
+  assert.match(textOf(empty), /no notebook/)
+  const added = await callTool(ctx, 'jupyter_notebook', { action: 'add', source: 'print("from the notebook")' })
+  assert.notEqual(added.isError, true, textOf(added))
+  assert.match(textOf(added), /added cell \d+ \(code\)/)
+  const id = /id: ([0-9a-f-]{36})/.exec(textOf(added))?.[1]
+  assert.equal(typeof id, 'string', textOf(added))
+  const read = await callTool(ctx, 'jupyter_notebook', { action: 'read', count: 100 })
+  assert.ok(textOf(read).includes(`· ${id} · agent ---`), textOf(read))
+  assert.match(textOf(read), /print\("from the notebook"\)/)
+})
+await check('jupyter_notebook runs, updates and deletes that cell', async () => {
+  const added = await callTool(ctx, 'jupyter_notebook', { action: 'add', source: 'print("from the notebook")' })
+  const id = /id: ([0-9a-f-]{36})/.exec(textOf(added))?.[1]
+  assert.equal(typeof id, 'string', textOf(added))
+
+  const ran = await callTool(ctx, 'jupyter_notebook', { action: 'run', id }, 'notebook-run')
+  assert.notEqual(ran.isError, true, textOf(ran))
+  assert.match(textOf(ran), /from the notebook/)
+  assert.match(textOf(ran), /ok/)
+
+  const updated = await callTool(ctx, 'jupyter_notebook', { action: 'update', id, source: 'print("changed")' }, 'notebook-update')
+  assert.match(textOf(updated), /updated cell/)
+
+  const deleted = await callTool(ctx, 'jupyter_notebook', { action: 'delete', id }, 'notebook-delete')
+  assert.match(textOf(deleted), /deleted cell/)
+})
+await check('an edit against a revision the model did not see is refused', async () => {
+  const added = await callTool(ctx, 'jupyter_notebook', { action: 'add', source: 'x = 1' })
+  const id = /id: ([0-9a-f-]{36})/.exec(textOf(added))?.[1]
+  const refused = await callTool(ctx, 'jupyter_notebook', { action: 'update', id, source: 'x = 2', ifRevision: 999 })
+  assert.equal(refused.isError, true)
+  assert.match(textOf(refused), /changed since you read it/)
 })
 await check('an invalid argument is rejected by the registry before the body runs', async () => {
   const result = await callTool(ctx, 'jupyter_execute', {})

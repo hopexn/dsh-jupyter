@@ -9,7 +9,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -352,6 +352,19 @@ await check('an image is stored once by content and referenced by URL', async ()
   stored.dispose()
 })
 
+await check('the asset directory is bounded on a schedule, not once per process', () => {
+  const assets = new AssetStore({
+    directory: path.join(directory, 'assets-prune'),
+    maxDiskBytes: 5,
+    // Zero makes every write measure the directory, which is the point under test: the old code
+    // set a "pruned" flag on the very first call and never looked again.
+    pruneIntervalMs: 0,
+  })
+  for (const payload of ['aaaa', 'bbbb', 'cccc']) assets.put('image/png', Buffer.from(payload).toString('base64'))
+  const files = readdirSync(path.join(directory, 'assets-prune')).filter((name) => name.endsWith('.png'))
+  assert.equal(files.length, 2, `expected the oldest file to be pruned, found ${files.join(', ')}`)
+})
+
 await check('clearOutput and clearAllOutputs empty the outputs', async () => {
   const before = await notebooks.view(SESSION)
   assert.ok(before.cells[0].outputs.length > 0)
@@ -403,6 +416,96 @@ await check('an oversized image is summarized instead of embedded', () => {
   assert.match(rendered[0].text, /omitted/)
 })
 
+console.log('\nagent runs and inspection')
+
+await check('a run the agent performs becomes a cell, streamed like the user\'s own', async () => {
+  const SESSION = 'agent-run-session'
+  const isolated = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const events = []
+  isolated.subscribe(SESSION, (event) => events.push(event))
+  const recorder = isolated.beginAgentRun(SESSION, 'streamy')
+  assert.equal(events[0].type, 'insert')
+  assert.equal(events[0].cell.origin, 'agent')
+  assert.equal(events[0].cell.status, 'running')
+  const execution = await fake.runtime.execute(SESSION, 'streamy', { onOutput: recorder.onOutput })
+  recorder.finish(execution)
+  assert.ok(events.some((event) => event.type === 'text'), 'output has to stream, not only land at the end')
+  assert.equal(events.at(-1).type, 'cell')
+  const cell = (await isolated.view(SESSION)).cells.at(-1)
+  assert.equal(cell.origin, 'agent')
+  assert.equal(cell.status, 'ok')
+  assert.equal(cell.outputs[0].text, 'first\nsecond\n')
+})
+
+await check('a host-side failure of an agent run is shown on its cell', async () => {
+  const SESSION = 'agent-fail-session'
+  const isolated = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const recorder = isolated.beginAgentRun(SESSION, 'boom')
+  recorder.fail(new Error('socket closed'))
+  const cell = (await isolated.view(SESSION)).cells.at(-1)
+  assert.equal(cell.status, 'error')
+  assert.equal(cell.error, 'socket closed')
+})
+
+await check('runCellNow waits and returns what the cell printed', async () => {
+  const SESSION = 'run-now-session'
+  const isolated = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const cell = (await isolated.view(SESSION)).cells[0]
+  await isolated.command(SESSION, { action: 'updateCell', id: cell.id, source: 'print(7)' })
+  const outcome = await isolated.runCellNow(SESSION, cell.id)
+  assert.equal(outcome.status, 'ok')
+  assert.match(outcome.output, /ran print\(7\)/)
+  assert.equal(isolated.isRunning(SESSION), false)
+  assert.equal(typeof outcome.executionCount, 'number')
+})
+
+await check('a tool-driven run produces no "the user ran" note', async () => {
+  const SESSION = 'tool-run-session'
+  const notes = []
+  const isolated = new Notebooks({
+    directory,
+    execute: fake.runtime.execute,
+    kernelInfo: fake.runtime.kernelInfo,
+    activity: { record: (_sessionId, event) => notes.push(event), pending: () => notes.length, list: () => [] },
+  })
+  const cell = (await isolated.view(SESSION)).cells[0]
+  await isolated.command(SESSION, { action: 'updateCell', id: cell.id, source: 'print(1)' })
+  const before = notes.length
+  await isolated.runCellNow(SESSION, cell.id)
+  assert.equal(notes.length, before, 'the model already has the output; a user note would be a lie')
+})
+
+await check('the snapshot is bounded and carries the revision needed for a safe edit', async () => {
+  const SESSION = 'snapshot-session'
+  const isolated = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const cell = (await isolated.view(SESSION)).cells[0]
+  await isolated.command(SESSION, { action: 'updateCell', id: cell.id, source: `x = 1\n${'y'.repeat(5000)}` })
+  const snapshot = isolated.snapshot(SESSION, { maxSource: 100, maxOutput: 100 })
+  assert.equal(snapshot.cells[0].sourceTruncated, true)
+  assert.match(snapshot.cells[0].source, /characters omitted/)
+  assert.equal(typeof snapshot.cells[0].rev, 'number')
+  assert.equal(snapshot.cells[0].index, 1)
+})
+
+await check('reading a session that never opened a panel creates nothing', () => {
+  const isolated = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const snapshot = isolated.snapshot('never-opened')
+  assert.deepEqual(snapshot.cells, [])
+  assert.equal(isolated.size, 0)
+})
+
+await check('the outline names the cell, its kind and its last execution', async () => {
+  const SESSION = 'outline-session'
+  const isolated = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: fake.runtime.kernelInfo })
+  const cell = (await isolated.view(SESSION)).cells[0]
+  await isolated.command(SESSION, { action: 'updateCell', id: cell.id, source: 'import pandas as pd\nx = 1' })
+  await isolated.command(SESSION, { action: 'runCell', id: cell.id })
+  await isolated.idle(SESSION)
+  const outline = isolated.outline(SESSION)
+  assert.match(outline, /revision \d+/)
+  assert.match(outline, /1\. \[code\] Out\[\d+\].*import pandas as pd/)
+})
+
 console.log('\npanel activity')
 
 // A recorder instead of the real buffer: this file is about what the model reports, not about how
@@ -415,6 +518,14 @@ const watched = new Notebooks({
   activity: {
     record: (sessionId, event) => events.push({ sessionId, event }),
     pending: (sessionId) => events.filter((entry) => entry.sessionId === sessionId).length,
+    list: (sessionId) => events
+      .filter((entry) => entry.sessionId === sessionId)
+      .map((entry, index) => ({ key: `note-${index}`, summary: entry.event.type })),
+    forget: (sessionId) => {
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        if (events[index].sessionId === sessionId) events.splice(index, 1)
+      }
+    },
   },
 })
 const WATCHED = 'watched-session'
@@ -469,16 +580,27 @@ await check('reordering is not worth a note', async () => {
   assert.equal(events.length, before)
 })
 
-await check('the view counts what is waiting for the model', async () => {
+await check('the view counts what is waiting for the model, and names it', async () => {
   const view = await watched.view(WATCHED)
   assert.ok(view.pendingNotes > 0)
   assert.equal(watched.pendingNotes(WATCHED), view.pendingNotes)
+  assert.equal(view.notes.length, view.pendingNotes)
+  assert.equal(typeof view.notes[0].summary, 'string')
 })
 
 await check('a notebook with no buffer says nothing about notes', async () => {
   const view = await notebooks.view(SESSION)
   assert.equal('pendingNotes' in view, false)
   assert.equal(notebooks.pendingNotes(SESSION), 0)
+})
+
+await check('discarding notes empties the queue without touching the notebook', async () => {
+  const before = await watched.view(WATCHED)
+  assert.ok(before.pendingNotes > 0)
+  const after = await watched.command(WATCHED, { action: 'discardNotes' })
+  assert.equal(after.revision, before.revision, 'a discard changes no cell')
+  assert.equal('pendingNotes' in after, false)
+  assert.equal(watched.pendingNotes(WATCHED), 0)
 })
 
 console.log('\nhttp route')
