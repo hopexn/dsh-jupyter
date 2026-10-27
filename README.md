@@ -1,5 +1,7 @@
 # JupyterLab for DeepSeek Harness
 
+English · [简体中文](README.zh-CN.md)
+
 A DeepSeek Harness bundle that connects the harness to a Jupyter server. Give it a JupyterLab
 address — `http://aimax395.local:9002/lab` — and the agent can run code in a **persistent remote
 kernel**: variables, imports and the working directory survive between tool calls, so a
@@ -206,7 +208,7 @@ touching it. It is a convenience for this machine, not part of the package.
 ## How it works
 
 ```
-lib/index.js     Cordis plugin: Config schema, system-prompt guidance, the four tool definitions
+lib/index.js     Cordis plugin: Config schema, system-prompt guidance, the five tool definitions
 lib/runtime.js   Connection + kernel-session state: one kernel per DSH session, re-attach, mirror to disk
 lib/server.js    Jupyter Server REST client: URL normalization, token/password auth, XSRF, cookie jar
 lib/transport.js HTTP over node:http/https: keep-alive sockets, buffered responses, abort handling
