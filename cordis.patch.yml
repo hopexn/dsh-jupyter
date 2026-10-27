@@ -13,7 +13,7 @@
 #         name: '@local/dsh-jupyterlab'
 #         config:
 #           name: local
-#           url: http://aimax395.local:9002/lab
+#           url: http://jupyter.example.com:9002/lab
 #           token: <your token>
 #           kernelName: python3
 #           servers:

@@ -9,10 +9,10 @@
 # process), so this is the last five seconds: one resolution per app start. It is optional.
 #
 # Usage:
-#   sudo scripts/alias-host.sh aimax395 192.168.5.200
+#   sudo scripts/alias-host.sh jupyterbox 10.0.0.10
 #
 # Then point the plugin at the new name:
-#   url: http://aimax395:9002/lab
+#   url: http://jupyterbox:9002/lab
 set -eu
 
 name=${1:-}
@@ -24,7 +24,7 @@ if [ -z "$name" ] || [ -z "$address" ]; then
 fi
 
 case "$name" in
-  *.*) echo "refusing: \"$name\" contains a dot; pass a plain name such as aimax395" >&2; exit 2 ;;
+  *.*) echo "refusing: \"$name\" contains a dot; pass a plain name such as jupyterbox" >&2; exit 2 ;;
 esac
 
 if [ "$(id -u)" -ne 0 ]; then

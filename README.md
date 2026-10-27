@@ -2,187 +2,76 @@
 
 English · [简体中文](README.zh-CN.md)
 
-A DeepSeek Harness bundle that connects the harness to **one or more Jupyter servers at the same
-time**. Give it a JupyterLab address — `http://aimax395.local:9002/lab` — and the agent can run code
-in a **persistent remote kernel**: variables, imports and the working directory survive between
-tool calls, so a conversation can build up an analysis the way a notebook session does.
+A DeepSeek Harness bundle that connects the harness to **one or more Jupyter servers**. Point it at
+a JupyterLab address and the agent can run code in a **persistent remote kernel**: variables,
+imports and the working directory survive between tool calls. A local server and a remote machine
+can be connected at once, and every notebook page in the right sidebar runs on the server it is
+bound to.
 
-A local server and a remote machine can be connected at once, each with its own credentials. Every
-notebook page in the panel is bound to one of them, and that page's code runs on that server. A
-connection is added either by the agent (`jupyter_connect`) or by you, in the panel's connection
-form: an address, then a token or a password.
-
-Nothing runs locally: the plugin speaks Jupyter Server's REST API and kernel messaging protocol
-directly over `fetch` and a WebSocket, with no Python, no `jupyter_client`, and no npm
-dependencies beyond the packages DSH itself ships.
+Nothing runs locally: the plugin speaks Jupyter Server's REST API and kernel protocol directly,
+with no Python and no npm dependencies beyond the packages DeepSeek Harness ships.
 
 ## What the agent gets
 
 | Tool | Purpose |
 | --- | --- |
-| `jupyter_connect` | **Add** a JupyterLab address and verify the credentials; other connections stay connected. Normalizes `/lab`, `/tree` and `?token=...`; becomes the default for calls that do not name a server; reports the server version, kernelspecs, running kernels and the full connection list. |
-| `jupyter_status` | Every connected server, the default one's version, kernelspecs and running kernels, and which kernel this conversation is bound to. |
-| `jupyter_execute` | Run code in the kernel of the panel page's server (or of the server named by its `server` argument); returns stdout, the value of the last expression, stderr, tracebacks, and paths of saved image/PDF outputs. The run is also recorded as a cell in the panel, marked `Agent`. |
-| `jupyter_notebook` | Read the notebook in the panel (cells, source, outputs, execution counts, and the server it runs on) and `add`, `update`, `delete` or `run` one of its cells. `ifRevision` refuses an edit based on a version the model did not see; an `update` leaves a reviewable diff in the panel rather than silently replacing your code. |
-| `jupyter_kernel` | `list`, `start`, `restart`, `interrupt`, `shutdown`, or `attach` to a kernel on the server you name (default: the panel page's), including one that already exists on the server. |
+| `jupyter_connect` | Add a JupyterLab connection and verify its credentials. Other connections stay connected; the new one becomes the default. |
+| `jupyter_status` | Every connected server, the default one's version and kernels, and the kernel this conversation is bound to. |
+| `jupyter_execute` | Run code in the panel page's kernel (or a named connection). Returns stdout, the last expression, errors and saved image/PDF paths. The run is recorded as an `Agent` cell. |
+| `jupyter_notebook` | Read, add, update, delete or run a cell in the panel's notebook. An update leaves a reviewable diff instead of silently replacing your code. |
+| `jupyter_kernel` | List, start, restart, interrupt, shutdown or attach kernels on a server. |
 
-Sessions are bound per DeepSeek Harness conversation, so two chats do not share a namespace, and
-**kernels are bound per conversation *and* per server**: a page on the local server and a page on
-the remote one each have their own kernel. The bindings are mirrored to
-`$DSH_HOME/jupyterlab/kernels.json` under `<server>::<session>`, which means a plugin reload or an
-app restart re-attaches to the same kernels instead of silently starting empty ones. The pages
-themselves are mirrored separately, together with the server each one is bound to.
+Kernels are bound per conversation and per server, and the bindings are mirrored to
+`$DSH_HOME/jupyterlab/kernels.json`, so a reload or app restart re-attaches instead of starting an
+empty kernel.
 
-## The notebook panel
+## The panel
 
-The plugin also puts a notebook in the **right sidebar**, beside the conversation:
+The notebook lives in the **right sidebar**, beside the conversation:
 
-- **Cells**: `+ Cell` adds one below the last, `✕` deletes, `↑`/`↓` reorder, `⌫` clears one cell's
-  output, and the toolbar's `Clear outputs` empties them all. The chip in a cell's header switches
-  it between code and markdown; it names the language the panel draws (`Py`, `R`, `Jl`, or `<>` for
-  a kernel it has no tokenizer for). A markdown cell renders instead of running, and never touches
-  the kernel.
-- **Edit**: double-click a cell's source to edit it in place; `Done`, `Escape` or running it commits
-  the change. Clicking `Run` runs the cell as it stands. Code is syntax-highlighted both at rest
-  and while typing — in the kernel's own language, taken from the kernelspec, so an R cell is not
-  coloured with Python's keywords and an unknown kernel is shown as plain text rather than guessed
-  at. The editor is a transparent textarea over a coloured copy of its own text, so the caret,
-  selection and IME stay native (the layer steps aside while an IME composes).
-- **Keyboard**: `Shift+Enter` runs and leaves, `Ctrl/Cmd+Enter` runs in place with the editor still
-  open, `Ctrl/Cmd+S` saves without running, `Tab`/`Shift+Tab` indent and outdent (a selection is
-  indented line by line), `Enter` carries the current indentation and adds a level after `:` or `{`,
-  and `Escape` leaves without saving. Keys pressed mid-IME belong to the IME.
-- **Run**: `Shift+Enter` in the editor saves and runs — the same gesture as JupyterLab, and one
-  request: the cell's draft travels with the run instead of being saved first. Outputs render
-  beneath the cell: stdout, stderr, the value of the last expression, tracebacks, images
-  (PNG/JPEG/GIF/WebP), markdown, and HTML.
-- **Run all**: executes every non-empty code cell top to bottom, in one sequence, waiting for each
-  to finish so cell 3 sees what cell 2 defined. While it runs the button reads `Stop`: it interrupts
-  the cell that is executing and starts no more. Markdown cells and empty cells are skipped, and
-  cells added during the sequence are not picked up.
-- **Insert in the middle**: `+` in a cell's header adds a cell directly below it, instead of only
-  at the end of the notebook.
-- **Unsaved edits survive a reload**: text you typed but have not committed is parked in the tab's
-  `sessionStorage`, so an accidental F5 brings the editor back with the text in it. It never leaves
-  the browser — a draft is not a command. Drafts are kept per notebook, so switching pages to check
-  something and coming back finds the paragraph still there.
-- **Several notebooks per session**: the picker in the header switches between them, `+ New` starts
-  another (up to twelve, named by the host). Each page has its own cells, outputs and export, and
-  its own server binding; pages bound to the same server share that server's kernel, so a variable
-  defined on one page is still there on the next. `Run all` stops when you leave the page it was
-  running on — an invisible stop button is no stop button.
-- **Several servers per session**: the server picker at the start of the header chooses where the
-  visible page runs, and `Connect…` opens the connection list and the form that adds one — an
-  optional name, the address, then the auth mode and its credential. The name is what the picker
-  shows (a loopback connection is simply `localhost`); the address is the tooltip. Each connection
-  shows its auth mode plus `Edit` (rename it or replace its credential; a blank field keeps the
-  stored secret) and `Forget`. A page keeps its binding: page A can run on a local server while page B runs on a
-  remote machine, each with its own kernel and variables. Forgetting a connection closes this
-  host's channels to it but leaves the pages bound to it in place, saying `not connected` — it never
-  moves a notebook to another server behind your back.
-- **Long outputs fold**: past 24 lines (or 4 000 characters, or 2 000 for HTML) an output starts
-  collapsed with a `Show more` toggle, so one log-heavy cell cannot push the rest off the screen.
-- **Rich output**: a MIME bundle is rendered by its richest representation the panel can draw.
-  `text/html` — what pandas, polars and Styler emit — mounts as a real table inside a shadow root,
-  so its own CSS applies while it cannot reach the panel; the HTML is stripped of scripts and event
-  handlers first. `text/markdown` renders through the panel's own markdown parser (headings, lists,
-  tables, code fences with highlighting). `text/plain` is the fallback, and anything past 256 KiB
-  of markup falls back to it deliberately.
-
-- **Watched while it runs**: `Run` answers as soon as the kernel has the code, and the output is
-  pushed to the panel over a stream as it is produced. A cell that prints for a minute shows its
-  first line after a second, and closing or reloading the page does not stop it.
-- **Told to the agent**: an edit, a run (with its outcome and the tail of what it printed), a
-  deletion, a cleared output — each is queued for the model and delivered with its next step as a
-  context note attributed to this plugin, not as something the user typed. The header shows how
-  many notes are waiting (`2 queued`); clicking that badge lists exactly what will be sent and
-  offers to discard it. A run's start is replaced by its result, so the model sees one accurate
-  note per cell rather than a stream of them. The first batch of a session also carries a
-  one-line-per-cell map, so a note can say "cell 3" to a model that has not seen the notebook yet.
-- **Live**: while the panel is visible it also polls the host, carrying the revision it already has.
-  A run the agent performs in the shared kernel appears as a cell of its own, marked `Agent`, so
-  the notebook is a record of the whole analysis rather than the user's half of it. When nothing
-  changed the answer is two fields and never reaches Jupyter.
-- **Reviewable edits**: when the agent rewrites a cell you wrote (`jupyter_notebook` `update`), the
-  cell gets a `Changed` chip instead of quietly becoming different code. Opening it shows a line
-  diff of what was replaced; `Keep` accepts it, `Undo` restores your version in one command. Your
-  own edit is the new baseline and clears the marker.
-- **Kernel**: the header shows which server the page runs on and the kernel bound to it, and offers
-  `Interrupt` and `Restart kernel` — both for that page's server only, so restarting the remote
-  kernel does not touch the local one.
-- **Portable**: `Export` downloads the notebook as a `.ipynb` (nbformat 4.5, with execution counts
-  and outputs); `Import` replaces it with a file you pick. The conversion is documented as lossy —
-  raw cells become markdown, output types the panel cannot draw are dropped, oversized images and
-  markup fall back or are dropped — but every such loss is reported in a line under the toolbar
-  instead of happening quietly.
-
-**The panel and the agent share one kernel per page and per server.** A variable defined in a cell
-is visible to `jupyter_execute` (when it runs on that page's server) and vice versa, in both
-directions and immediately — there is no separate "notebook kernel". Concurrency is handled by the
-same per-kernel queue, so a cell you run while the agent is executing simply waits its turn. The
-agent can also read and edit the cells you wrote with `jupyter_notebook`, which is what makes "fix
-cell 3" a request it can act on instead of guessing at. A session can hold several notebooks, each
-bound to a server; every reply from the tool names the notebook and the server it runs on, and
-switching pages tells the model that earlier cell numbers no longer point where they did. A page on
-a different server is a different kernel, so its variables are not shared with this one.
-
-Cells are mirrored to `$DSH_HOME/jupyterlab/notebooks/<session>.json` (with the server each page is
-bound to), so a page reload or an app restart restores them. The connections added at run time are
-mirrored to `$DSH_HOME/jupyterlab/servers.json`, mode `0600` — the file holds credentials, in the
-same plaintext form the profile configuration does. Servers named in the profile config are not
-copied there: the config is re-applied on every start, so it stays the source of truth for them.
-
-### Opening it
-
-The panel opens itself once when a session first mounts. After that:
-
-- the **Notebook** button in the composer's tool row reopens it;
-- the right sidebar's **+** control lists it as a page (the guide entry);
-- once opened, the layout is remembered per session and restored on the next page load.
-
-Closing it costs nothing: the right column collapses, and the same button brings it back.
-
-`attach` is the bridge to interactive work: start a kernel in JupyterLab, then have the agent
-attach to it and pick up the variables you already defined.
+- **Cells**: add, delete, insert below, reorder, clear output; code and markdown; syntax
+  highlighting in the kernel's own language.
+- **Edit in place**: `Shift+Enter` runs and leaves, `Ctrl/Cmd+Enter` runs in place, `Ctrl/Cmd+S`
+  saves, `Tab`/`Shift+Tab` indent, `Enter` keeps indentation, `Esc` leaves. IME composition is left
+  to the IME.
+- **Run**: `Run` answers as soon as the kernel has the code and streams the output as it is
+  produced. `Run all` executes the code cells in order; the button turns into `Stop`.
+- **Rich output**: images, `text/html` (sanitized, mounted in a shadow root), markdown, plain text.
+  Long output folds.
+- **Reviewable edits**: when the agent rewrites a cell, it gets a `Changed` chip with a line diff;
+  `Keep` accepts it, `Undo` restores your version.
+- **Several notebooks per session**: up to twelve, each with its own cells, output and export; they
+  share the kernel of the server they are bound to.
+- **Several servers per session**: the header picker chooses where the visible page runs, and
+  `Connect…` adds a connection (name, address, password/token/proxy cookie). Each connection can be
+  `Edit`ed (rename, replace a credential) or `Forget`ed. A loopback server is shown as `localhost`.
+- **Drafts survive a reload**: uncommitted text is parked in the tab's `sessionStorage`.
+- **Portable**: `Export` downloads the page as `.ipynb`; `Import` loads one.
+- **Live**: runs the agent performs appear as `Agent` cells, and what you edit or run reaches the
+  model as context on its next step (the header badge shows what is queued).
 
 ## Install
 
-From this directory, in a DeepSeek Harness session:
+From a checkout of this repository, in a DeepSeek Harness session:
 
 ```
-plugin_manager { action: "install_bundle", target: "/Users/yanhaopeng/MyProjects/dsh-jupyter" }
+plugin_manager { action: "install_bundle", target: "<path to this repository>" }
 ```
 
-The bundle is installed into the current profile, added to `dsh.profile.bundles`, and activated
-through HMR. Read the result's `application` field — `applied` means it is live.
-
-A **first** install needs one app restart, for two independent reasons: the host half imports
-nothing, but Node caches an already-imported module by URL, so a running process keeps the code it
-first loaded; and the host resolves a package's client bundle from the manifest it read at boot.
-After that restart, host-half edits still need a restart while client-half edits are picked up by a
-page refresh. If the host half's
-imports of `@deepseek-ai/*` packages cannot be resolved in the running process, restart the
-DeepSeek Harness app once; after that, source edits are picked up from this directory.
+The bundle is installed into the current profile and activated. A **first** install needs one app
+restart. After that, host-side edits need a restart and browser-side edits only need a page refresh.
 
 ## Configure
 
-`url` is the only field that matters to get started; everything else has a default. A second
-server can be added later from the panel, or up front with `servers:`.
+`url` is the only field that matters to get started; everything else has a default.
 
 **Let the agent do it.** The plugin loads with no configuration at all. Say "connect to
-http://aimax395.local:9002/lab with token XYZ" and the agent calls `jupyter_connect`, which adds
-that connection and makes it the default. Runtime-added connections are remembered in
-`$DSH_HOME/jupyterlab/servers.json`, so they survive a plugin remount and an app restart.
+`http://jupyter.example.com:9002/lab` with token XYZ" and the agent calls `jupyter_connect`.
+Runtime-added connections are remembered in `$DSH_HOME/jupyterlab/servers.json`.
 
-**Or add it in the panel.** `Connect…` in the notebook header opens the connection list and a short
-form: an optional **name** (what the picker shows instead of the address), the JupyterLab address,
-the auth mode — `Password` (the default), `Token`, or `Proxy cookie only` — and the credential.
-There is no username field: Jupyter ignores it, so asking for it only made the form longer. Hitting
-`Connect` verifies the address and credentials against the server; a failure leaves the form open
-with the address still typed and the server's answer in the error line. The list shows each
-connection by name, with its address, auth mode and a `Forget` button. Credentials exist on the
-host side only: the panel gets back a name, an address, a label and the auth mode, never a token or
-password.
+**Or use the panel.** `Connect…` in the notebook header opens the connection list and a short form:
+an optional name, the address, the auth mode (`Password` by default, `Token`, or `Proxy cookie
+only`) and the credential.
 
 **Or write it into the profile.** Add a `config:` mapping to the plugin's row in
 `$DSH_PROFILE_DIR/cordis.patch.yml`, which overrides the bundle's own patch:
@@ -192,96 +81,63 @@ password.
   name: '@local/dsh-jupyterlab'
   config:
     name: local
-    url: http://aimax395.local:9002/lab
+    url: http://jupyter.example.com:9002/lab
     token: <your token>
     kernelName: python3
-    # Optional: a second connection, ready before the panel is opened. `servers` entries inherit
-    # every non-credential option above; credentials belong to the host they are entered for, so a
-    # token here is never sent to the other server.
+    # Optional: a second connection, ready before the panel is opened. Credentials belong to the
+    # host they were entered for, so a token here is never sent to another server.
     servers:
       - name: GPU box
-        url: http://gpu-box:9003/lab
+        url: http://gpu-box.example.com:9003/lab
         password: <the plaintext password>
         kernelName: python3
 ```
 
 ### Credentials
 
-Jupyter accepts either a token or a password, and both are supported:
+Jupyter accepts a token or a password, and both are supported:
 
 - **token** — the `?token=...` from `jupyter server list`, the server's console output, or the URL
-  JupyterLab opens with. Highest priority; if the `url` itself carries `?token=...`, it is used
-  automatically.
-- **password** — the plaintext password you type into the JupyterLab login page. The plugin
-  performs the `/login` form flow (including `_xsrf`) and replays the session cookie on REST calls
-  and on the kernel WebSocket upgrade.
+  JupyterLab opens with.
+- **password** — the plaintext password you type into the JupyterLab login page. A password *hash*
+  from `jupyter_server_config.json` cannot be replayed and is rejected.
+- **proxy cookie** — see below, for deployments behind a corporate access gateway.
 
-A password *hash* from `jupyter_server_config.json` (the `argon2:$argon2id$...` value) is not a
-credential: it cannot be replayed and will be rejected. Use the plaintext password, or a token.
-
-A credential belongs to the host it was entered for. Adding a server through `jupyter_connect` or
-the panel never reuses another server's token or password, so a connection can never disclose the
-old server's secret to a new one. A `password` hash is per deployment; the plaintext credential is
-what to store.
-
-Two places hold credentials, both plaintext and both yours to protect: the profile YAML you wrote,
-and `$DSH_HOME/jupyterlab/servers.json` (mode `0600`) for connections added at run time. A server
-named in the profile config is *not* copied into that file — the config re-creates it on every
-start, so removing it from the config actually removes it. Forgetting a config-provided connection
-in the panel lasts until the next start, because the config brings it back; delete the config entry
-to remove it for good.
+Credentials belong to the host they were entered for. Connections added at run time are stored in
+`$DSH_HOME/jupyterlab/servers.json` (mode `0600`, plaintext like your profile config); servers named
+in the profile are re-created from the profile on every start and are not copied there.
 
 ### Behind an SSO / access proxy
 
-Some deployments put a corporate access proxy in front of Jupyter (openresty with an SSO gate, a
-zero-trust gateway, an `oauth2-proxy`). It answers **every** unauthenticated path — `/lab`,
-`/api/status`, even Jupyter's own `/login` — with a `302` to its login page, so neither a token nor
-a Jupyter password is ever seen by the server. The plugin reports that honestly instead of
-following the redirect:
+Some deployments put an SSO/access gateway in front of Jupyter. It answers every unauthenticated
+path — `/lab`, `/api/status`, even Jupyter's own `/login` — with a redirect to its login page, so
+neither a token nor a password ever reaches Jupyter. Sign in through the browser, then bring the
+browser's cookie along:
 
-```
-jupyter: …/api/kernels was redirected (HTTP 302 to sso.example.com) — the request never reached
-Jupyter, so this is an SSO/access proxy in front of it rather than a wrong credential.
-```
+1. Open the address in your browser and sign in as usual.
+2. DevTools → **Network** → any request to that host → **Request Headers** → copy the `Cookie:`
+   value.
+3. In the panel: `Connect…` → address → auth mode `Proxy cookie only` (or `Password`/`Token` when
+   Jupyter itself also wants one) → paste into **Proxy cookie** → `Connect`.
 
-The way through is the browser's own session: **paste its cookie**.
+The cookie is sent on REST calls and on the kernel WebSocket upgrade, and its `_xsrf` value becomes
+the XSRF header. It is stored with the connection, so a restart keeps it until the gateway session
+expires; when it does, `Edit` the connection and paste a fresh one.
 
-1. Open the Jupyter address in your browser and sign in through the gateway as usual.
-2. DevTools → **Network** → any request to that host → **Request Headers** → copy the whole
-   `Cookie:` value (it usually contains something like `accessproxy_session=…; apdid=…`).
-3. In the notebook panel: `Connect…` → the address, then pick the auth mode: `Token` or `Password`
-   when the Jupyter behind the proxy has its own credential, or `Proxy cookie only` when the
-   gateway is the whole authentication. Paste the cookie into **Proxy cookie (optional)** →
-   `Connect`.
-
-The cookie is sent on every REST call and on the kernel WebSocket upgrade, and an `_xsrf` inside it
-is echoed as the XSRF header on mutating requests (which is what makes starting a kernel work).
-It can be the only credential, or ride along with a token/password.
-
-Two limits worth knowing:
-
-- **It is saved with the connection.** Like a token or a password, the cookie is written to
-  `$DSH_HOME/jupyterlab/servers.json` (mode `0600`, atomically replaced), so a restart does not ask
-  you to copy a browser header again. When the gateway session expires, the next call fails with
-  the same readable 302/401 and `Edit` in the connection list is where a fresh one goes.
-- **A gateway may bind the session to the browser** (device id, fingerprint, user agent). If a
-  freshly pasted cookie still comes back as a 302, replay is not accepted: ask for a directly
-  reachable Jupyter address or a service token, or have the deployment expose a route that does not
-  sit behind the SSO gate.
-
-The same value is accepted by `jupyter_connect` (`cookie` argument) and by the config
-(`servers: [{url, cookie}]`, host-side only).
+If a freshly pasted cookie is still redirected, the gateway is rejecting the replay (some bind the
+session to a device or browser fingerprint). In that case use an address that is reachable directly,
+or ask the deployment for a service token.
 
 ### Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `url` | — | JupyterLab address. `/lab`, `/tree`, trailing slashes and `?token=...` are understood. |
-| `name` | — | Label shown in the panel instead of the address, e.g. `local` or `GPU box`. Not part of the connection's identity. |
-| `servers` | — | Extra connections: an array of `{url, token?, password?, username?, kernelName?, workingDirectory?}`. Each inherits the non-credential options above; the first connection configured is the default unless `url` is also set. |
+| `name` | — | Label shown in the panel instead of the address. Not part of the connection's identity. |
 | `token` / `password` / `username` | — | Credentials; `token` wins. |
-| `cookie` | — | Raw `Cookie` header from a signed-in browser request, for an SSO/access proxy in front of Jupyter. Saved with the connection in `servers.json` (`0600`); replace it with `Edit` when the gateway session expires. |
-| `kernelName` | `python3` | Kernelspec started for a new session kernel. |
+| `cookie` | — | Cookie header for an SSO/access proxy. |
+| `servers` | — | Extra connections: `{url, name?, token?, password?, cookie?, kernelName?, workingDirectory?}`. |
+| `kernelName` | `python3` | Kernelspec started for a new kernel. |
 | `workingDirectory` | server root | Server-relative directory the kernel starts in. |
 | `requestTimeoutMs` | `20000` | Budget for one REST call. |
 | `executeTimeoutMs` | `180000` | Budget for one execution before the kernel is interrupted. |
@@ -289,271 +145,68 @@ The same value is accepted by `jupyter_connect` (`cookie` argument) and by the c
 | `maxOutputChars` | `20000` | Streamed output kept per execution (head and tail). |
 | `artifactDirectory` | `$DSH_HOME/jupyterlab/artifacts` | Where image/PDF outputs are written. |
 
-### If the address is a `.local` name
+## Notes
 
-On macOS, resolving a `host.local` name takes about five seconds: `mDNSResponder` multicasts first
-and only then falls back to `/etc/hosts`. The plugin pays that once per process (the cache is warmed
-at mount, and every later request or kernel handshake reuses it), never per click. To remove even
-that one, give the machine a name without the `.local` suffix:
-
-```bash
-sudo scripts/alias-host.sh aimax395 192.168.5.200   # /etc/hosts: 192.168.5.200 aimax395
-```
-
-then set `url: http://aimax395:9002/lab`. The script is idempotent and backs up `/etc/hosts` before
-touching it. It is a convenience for this machine, not part of the package.
-
-## How it works
-
-```
-lib/index.js     Cordis plugin: Config schema, system-prompt guidance, the five tool definitions
-lib/connections.js  The registry of servers: keys, credentials, describe list, servers.json
-lib/runtime.js   Kernel-session state: one kernel per server per DSH session, re-attach, mirror to disk
-lib/server.js    Jupyter Server REST client: URL normalization, token/password auth, XSRF, cookie jar
-lib/transport.js HTTP over node:http/https: keep-alive sockets, buffered responses, abort handling
-lib/dns-cache.js Process-wide name-resolution cache, plugged into http and the kernel socket
-lib/websocket.js Minimal RFC 6455 client for the kernel channel: masking, fragmentation, ping/pong
-lib/kernel.js    Kernel messaging protocol over that socket: execute, stream iopub outputs, interrupt
-lib/notebook.js  The panel's model: cells, incremental output rendering, background runs, mirror
-lib/activity.js  What the user did in the panel, buffered and handed to the model at its next step
-lib/assets.js    Content-addressed image store: one file per unique picture, served immutable
-lib/routes.js    The panel's four authenticated same-origin routes (view/command, stream, assets, download)
-lib/client.js    Browser half: the right-sidebar tab type and the notebook UI (no build step)
-```
-
-Design notes worth knowing:
-
-- **The transport is `node:http`, not `fetch`, because `fetch` re-resolves the hostname.** A Jupyter
-  server addressed by a mDNS name (`http://aimax395.local:9002/lab`) costs **about five seconds per
-  `getaddrinfo` call** on macOS — `mDNSResponder` multicasts first and only then falls back to
-  `/etc/hosts`. `fetch` and the built-in `WebSocket` both resolve the name themselves, per
-  connection, with no way to pass a resolver, and connecting to the raw IP instead is refused by
-  Jupyter, which checks the `Host` header (a valid token plus a mismatched `Host` is a 403).
-  `node:http` solves all of it: a custom `lookup` goes through `dns-cache.js`, the name still
-  arrives as `Host` and as TLS SNI, and a keep-alive agent means a second request costs only the
-  round trip. Measured against the server above: a panel click went from **5 020 ms to 6 ms**, and
-  a warm `jupyter_execute` from **10 122 ms to 83 ms**.
-- **The kernel channel uses its own WebSocket client** for the same reason, plus one more: the
-  handshake is the one place where the `Host` header must stay correct *and* the resolver must be
-  ours. `lib/websocket.js` implements only what the kernel protocol needs.
-- **Name resolution is warmed at mount.** The single five-second lookup is unavoidable per process,
-  so `runtime` starts it when the plugin mounts instead of leaving it for the first tool call; the
-  result lands in the cache the transport reads.
-- **The plugin never fails to load.** `url` is optional and the REST client is built lazily, so a
-  missing or wrong address surfaces as one readable tool error instead of an activation failure.
-- **A session holds a registry of servers, and a notebook page picks one.** The identity is the
-  normalized address (`http://host:9002`, no `/lab`, no trailing slash), so a pasted JupyterLab URL,
-  a `?token=` URL and a scheme-less host all name the same connection. Kernel bindings are keyed
-  `<server>::<session>` in memory and on disk, which is what makes two pages on two servers two
-  kernels, and what keeps one page's variables out of the other's. A page stores that key (`null`
-  means "follow the default"), so a restart reopens the notebook on the server it was using.
-- **The connection list added at run time is a file, mode 0600, written atomically.** It holds the
-  token or password of the servers you added in the panel or through `jupyter_connect`, because
-  re-entering them after every restart is not a feature. Entries that come from the profile config
-  are deliberately not copied into it: the config is re-applied on every boot, so it stays the
-  source of truth, and removing a connection from the config removes it from the product.
-- **A forgotten connection is not a silent fallback.** Removing a server closes this host's kernel
-  channels to it and drops its bindings, but the pages bound to it keep the key: they render, say
-  `not connected`, and their next run fails with the readable "no such connected server" error
-  rather than quietly executing on another machine. Nothing moves a user's notebook between hosts
-  behind their back.
-- **A connection is verified before it is kept.** `connectServer` adds the connection, probes it
-  (`/api/status`, kernelspecs, kernels), and removes it again if the probe fails — a typo in an
-  address or a wrong token does not leave a dead entry in the picker that only looks connected.
-- **Execution is serialized per kernel.** iopub carries no request id, so concurrent executions on
-  one kernel would interleave their output. Each call queues behind the previous one.
-- **Cancellation interrupts the kernel.** `exec.signal` (from the tool timeout policy or the user)
-  and the execution budget both send `POST /api/kernels/<id>/interrupt`, then return whatever the
-  cell printed before stopping. The kernel and its variables stay alive.
-- **A dead kernel is detected before code is sent.** If the channel is closed, the binding is
-  verified against `GET /api/kernels/<id>` and either re-attached or replaced. A transient
-  reconnect failure never shuts a kernel down; only an explicit `jupyter_kernel start` does.
-- **Errors are readable, not stack traces.** Wrong credentials report `authentication failed`;
-  an unreachable host reports the address and the routing hint; a non-Jupyter URL reports that the
-  response was not JSON. A rejected password (401) is reported differently from a rejected XSRF
-  token (403), because the two need different fixes.
-- **Cookie sessions carry an XSRF token.** Jupyter checks XSRF on every mutating request, and
-  skips that check only for header-authenticated (token) calls. A password session therefore sends
-  the `_xsrf` value as an `X-XSRFToken` header on every POST and DELETE — without it, login
-  succeeds and reads work, but starting a kernel fails with `'_xsrf' argument missing from POST`.
-- **The panel route registers on a dynamic injection.** The `connection` entry that owns `/api`
-  waits on its own inject chain, so on a cold boot it is routinely *not yet provided* when a plugin
-  mounting later runs `apply`. Reading the service once and giving up silently produced the worst
-  possible symptom — a panel that loads and then answers 404 to everything — so the route goes
-  through `ctx.inject(['connection'], …)`, and `jupyter_status` reports whether it registered.
-- **A cell the kernel dropped is retried once.** Immediately after an interrupt, Jupyter answers
-  the next `execute_request` with `status: "aborted"` — the cell never ran. That is reported as
-  `aborted` (never as a silent empty success) and retried once, which is safe precisely because
-  nothing executed the first time.
-- **A panel run is owned by the model, not by the request.** `POST runCell` answers in milliseconds
-  and the execution continues without an HTTP request attached to it. Output leaves the kernel's
-  iopub channel as it is produced, is coalesced for 60 ms (one frame per message would cost more
-  than the rendering it feeds), and travels to the browser over SSE on
-  `/api/jupyterlab/notebook/stream`. A `cell` event closes the run with the authoritative state.
-  This is also why reloading the page no longer interrupts the cell: previously the abort of the
-  POST was wired all the way to `POST /api/kernels/<id>/interrupt`.
-- **A run's output is rendered twice, on purpose.** Incrementally while it runs, so the panel grows;
-  then once more from the kernel's final output list, so the cell the user keeps — and the mirror on
-  disk — is byte-identical to what a non-streamed run would have produced.
-- **Panel activity reaches the model as context, not as a chat message.** The user edits and runs
-  cells in the very kernel the agent uses, so without a note the agent's next request describes a
-  notebook that no longer exists — a variable redefined, an output cleared, a cell deleted. Notes
-  are buffered per session and appended to the step's messages in `agent/pre-step`, the same
-  waterfall `time-context` and `agent-instructions` use, with
-  `source: { kind: 'plugin', plugin: 'jupyterlab', form: 'notice' }`; the transcript shows them as
-  a collapsed context row instead of user speech. Two guards matter: a rejected or aborted step
-  keeps its notes, and a first step with no message is never turned into a model call by a note —
-  an edit is context for a conversation, not a reason to start one. A run's start and end share
-  one key, so only the outcome survives.
-- **Images are addressed by their content.** `lib/assets.js` hashes the bytes and writes one file
-  per unique picture; the cell keeps `api/jupyterlab/asset?name=<hash>.png` and the route answers
-  with `immutable`. Running the same plot again re-uses the URL, a notebook with ten figures costs
-  ten files instead of a multi-megabyte document, and every click no longer re-serializes the
-  pictures. (The route takes the name in a query parameter because `connection.fetch` matches
-  **exact** pathnames — a path segment would 404.)
-- **`React.memo` needs stable props, so the panel provides them.** Each cell carries a `rev`
-  counter; a view fetched from the host reuses the previous cell object when the `rev` still
-  matches, and every handler is created once and reads current state from a ref. Without that,
-  re-rendering a hundred cells on every poll was the cost the transport work had just removed
-  from the host.
-- **A session holds a desk of notebooks, mirrored as one file.** `{active, notebooks}` is written
-  atomically because a crash between two files could reopen the wrong page; a mirror from before
-  multi-notebook became `main` on load, so an upgrade never loses the only page there was. Switching
-  pages is broadcast on the stream as its own event and makes the client re-read the whole view: a
-  different document cannot be expressed as a patch to the cell list. It also drops the revision
-  guard, because revisions are only comparable within one notebook.
-- **The highlighter is a tokenizer, not a parser.** There is no build step and no client package,
-  so one regex pass with a deliberate priority — IPython magic at a line start, then comments, then
-  strings, then numbers, names and operators — produces the coloured runs the editor draws. It
-  cannot be wrong about a string that contains a `#`, which is the failure that matters; it does not
-  try to colour f-string expressions or parenthesis depth. The language comes from the kernelspec,
-  not from the notebook: Python, R and Julia each get their own keyword set and their own regex,
-  and a kernel outside those three is rendered as plain text — colouring it with Python's grammar
-  would teach a wrong one. The markdown parser follows the same principle: block structure by line,
-  inline spans by one regex, every node built through `createElement` rather than an HTML string.
-- **Kernel HTML is mounted, not injected.** An output is whatever the cell decided to print, so it
-  is parsed with `DOMParser`, stripped of `script`/`iframe`/`object`/`link`/`meta`/`base`/`form`,
-  every `on*` attribute, `srcdoc`, and `javascript:` URLs, then appended to a **shadow root** on its
-  own host element. A shadow root gives the table its natural height and full CSS isolation: pandas'
-  `style scoped` and a Styler's rules apply to it, and neither they nor `body { display: none }`
-  can affect the panel. It is the same trick JupyterLab uses an iframe for, without the iframe's
-  fixed height.
+- **The remote server must be reachable from the harness's own machine.** There is no SSH tunnel or
+  port forwarding: a Jupyter that listens only on another machine's `127.0.0.1` cannot be reached
+  through that machine's name. A DNS name, a routed IP or a gateway is fine.
+- **A `.local` address costs one slow lookup per process.** On macOS, mDNS resolves such a name in
+  about five seconds; the plugin pays it once at mount and caches it. An `/etc/hosts` alias avoids
+  even that — `scripts/alias-host.sh` is a convenience for that, not part of the package.
+- **`.ipynb` import and export are lossy.** Raw cells become markdown, output types the panel cannot
+  draw are dropped, and oversized images or markup fall back or are dropped. Every loss is reported.
+- **Credentials are plaintext files.** `servers.json` is mode `0600`; there is no keychain
+  integration.
 
 ## Documentation
 
-- **`docs/design.md`** — the design and the index: how the two halves fit together, where each
-  concern lives (file + symbol), and the reasons behind the decisions that look odd. **Read it
-  first when changing code**; `AGENTS.md` gives agents the same instruction.
-- **`docs/performance-review.md`** — what was slow, what was measured, what changed, and the
-  headroom that is still open.
-- **`docs/dsh-client-plugin-contract.md`** — the host/plugin contract this panel was built
-  against, extracted from the shipped packages as reference.
+- **`docs/design.md`** — how the plugin is put together and why: transport, connections, kernel
+  lifecycle, panel protocol, and the decisions behind them.
+- **`docs/performance-review.md`** — measurements and the headroom that remains.
+- **`docs/dsh-client-plugin-contract.md`** — the host/plugin contract the panel was built against.
 
 ## Verifying a change
 
-Two test suites run against a live Jupyter server. Start a throwaway one **without** weakening
-its security defaults — a server started with `disable_check_xsrf` hides real authentication bugs,
-which is exactly how the missing `X-XSRFToken` header survived the first round of testing here:
+```bash
+npm test                  # offline suites, plus e2e and register when JUPYTER_TEST_URL is set
+npm run test:offline      # transport, ipynb, notebook, activity, client
+```
+
+The e2e suites need a live Jupyter server. Start a throwaway one without weakening its security
+defaults (a server started with `disable_check_xsrf` hides real authentication bugs):
 
 ```bash
 # Token auth.
-jupyter server --no-browser --port=9003 \
-  --IdentityProvider.token=dsh-test-token --ServerApp.root_dir=/tmp/dsh-jupyter-test
+jupyter server --no-browser --port=9003 --IdentityProvider.token=<token> \
+  --ServerApp.root_dir=/tmp/jupyter-test
 
-# Password auth (the configuration a typical deployment uses). The trait is
-# `IdentityProvider.hashed_password`; a bare `password` option is silently ignored, which looks
-# exactly like a wrong password.
-python -c "from jupyter_server.auth import passwd; print(passwd('dsh-test-password'))"
+# Password auth. The trait is `IdentityProvider.hashed_password`; a bare `password`
+# option is silently ignored, which looks exactly like a wrong password.
+python -c "from jupyter_server.auth import passwd; print(passwd('<password>'))"
 jupyter server --no-browser --port=9004 \
-  --IdentityProvider.hashed_password='<hash from above>' --ServerApp.root_dir=/tmp/dsh-jupyter-test
+  --IdentityProvider.hashed_password='<hash from above>' --ServerApp.root_dir=/tmp/jupyter-test
 ```
 
 Then:
 
 ```bash
-npm test                 # the five offline suites; JUPYTER_TEST_URL adds e2e and register
-npm run test:offline     # same, explicitly without a server
-
-node test/e2e.mjs        # protocol and runtime: auth, execute, persistence, timeout, kernel lifecycle
-node test/register.mjs   # mounts the plugin in a real cordis context with the real dsh-tools registry
-node test/notebook.mjs   # the panel model, its routes, streaming, agent cells, run-all, import
-node test/ipynb.mjs      # .ipynb both ways: line arrays, images, budgets, and what gets dropped
-node test/activity.mjs   # activity notes: wording, batching, outline, and the pre-step delivery guards
-node test/client.mjs     # the browser bundle: registrations, render paths, clicks, stream patches
-node test/transport.mjs  # DNS cache, socket reuse, Host header, and the WebSocket frame codec
-
-# The password path (login form, XSRF, cookie session) — run this before trusting a deployment:
-JUPYTER_TEST_URL=http://127.0.0.1:9004/lab JUPYTER_TEST_PASSWORD=dsh-test-password node test/e2e.mjs
-
-# Any other server, including the real one:
-JUPYTER_TEST_URL=http://host:9002/lab JUPYTER_TEST_PASSWORD=... node test/e2e.mjs
-JUPYTER_TEST_URL='http://host:9002/lab?token=...' node test/e2e.mjs
+JUPYTER_TEST_URL=http://127.0.0.1:9003/lab JUPYTER_TEST_TOKEN=<token> node test/e2e.mjs
+JUPYTER_TEST_URL=http://127.0.0.1:9004/lab JUPYTER_TEST_PASSWORD=<password> node test/e2e.mjs
 ```
 
-The multi-connection checks run without a second deployment: `test/e2e.mjs` reaches the same live
-server through its other loopback spelling (`localhost` vs `127.0.0.1`), which is a distinct
-connection key, so kernels, bindings and `servers.json` are exercised for two connections. A real
-second server can be given with `JUPYTER_TEST_URL_2` (and `JUPYTER_TEST_TOKEN_2` /
-`JUPYTER_TEST_PASSWORD_2` when it authenticates differently).
-
-`test/transport.mjs` needs no Jupyter server: it starts its own HTTP and WebSocket peers on
-127.0.0.1, counts the sockets the client opens, and round-trips frames of every length class.
-
-`test/e2e.mjs` needs no DSH packages. `test/register.mjs` imports `@deepseek-ai/cordis` and
-`@deepseek-ai/dsh-tools`, which resolve inside a DSH host process; outside one, link them (this is
-a development-only link, never part of the installed plugin):
-
-```bash
-ln -s <extracted-dsh-packages>/node_modules node_modules
-```
-
-Both suites take `JUPYTER_TEST_URL`, `JUPYTER_TEST_TOKEN`, and `JUPYTER_TEST_PASSWORD`.
+`test/register.mjs` additionally needs `node_modules` linked to the DeepSeek Harness packages (a
+development-only link, never part of the installed plugin).
 
 ## Limitations
 
-- **The panel is a notebook, not JupyterLab.** JupyterLab sends `Content-Security-Policy:
-  frame-ancestors 'self'`, so it cannot be framed in the Harness UI; the panel is a native
-  reimplementation of the notebook surface instead. It supports code and markdown cells with add,
-  edit, delete, insert, run, run-all, reorder and type switching — no completion, no variable
-  inspector, no debugger.
-- **Several notebooks can be open, but not managed.** A session can hold up to twelve, each with its
-  own cells, export and server binding; none can be renamed, closed or deleted. Pages bound to the
-  same server share that server's kernel — so variables and imports carry across — while a page
-  bound to another server has a kernel of its own, which is why cell numbers and variables do not
-  cross between them. Export writes the page you are looking at.
-- **`.ipynb` import and export are lossy.** Reading and writing notebook files works, but the panel
-  holds a subset of the format: raw cells are imported as markdown, output types it cannot draw and
-  images over 2 MiB are dropped, `text/html` over 256 KiB becomes plain text, and a document is
-  capped at 500 cells. Every loss is reported; the file is not byte-identical to what JupyterLab
-  would write.
-- **Output support is a chosen subset.** Images, `text/html`, `text/markdown` and text are rendered;
-  `application/json`, LaTeX and arbitrary MIME types are not (a `display_data` carrying only those
-  names its MIME types instead of drawing them). HTML is sanitized rather than trusted, so an output
-  that relies on its own `<script>` — an interactive widget, a plotly figure — renders its static
-  markup only.
-- **A cell's output streams while it runs.** `Run` answers as soon as the kernel has the code, and
-  iopub output is pushed to the panel as it is produced, so a cell that prints for a minute shows
-  its first line after a second. The interrupt button stays reachable throughout.
-- **Panel notes arrive at the next step.** A queued note is context for the next model request, not
-  a message sent on the user's behalf: editing a cell while the agent is idle updates the badge and
-  sends nothing until the conversation continues. Nothing is injected into a request already in
-  flight.
-- **Only connections have a form.** The panel can add and forget servers, but every other option
-  (`kernelName`, timeouts, output budgets, working directory) still comes from the profile YAML or
-  the plugin defaults. `Edit` in the connection list renames a connection or replaces its
-  credential (a blank field keeps the stored secret); the address and the auth mode are fixed there
-  because another address is another server. A connection with no server configured renders the
-  kernel row as `not connected`; `Connect…` is the way out.
-- **The config schema is validated but not projected.** Because the plugin is import-free, its
-  `Config` is a hand-written Standard Schema rather than a schemastery one, so Cordis still
-  validates and defaults every option (a bad value fails activation with a readable message), but
-  the `Config` inspect provider reports `unsupported` instead of rendering a JSON Schema.
-- **A remote server has to be reachable from the harness's own machine.** There is no SSH tunnel or
-  port-forward in the plugin: a Jupyter that listens only on `127.0.0.1` on another machine cannot
-  be reached through that machine's name. Point the connection at an address this machine can open
-  (a DNS name, a routed IP, a gateway) — a `.local` or `.internal` name is fine, and so is a
-  reverse proxy with a path prefix.
-- **Code execution only.** The Contents API (reading and writing notebook files on the server) is
-  not exposed yet.
-- Kernels are left running when a DSH session ends; shut them down with `jupyter_kernel` or in
-  JupyterLab.
+- **The panel is a notebook, not JupyterLab.** No completion, variable inspector or debugger; it
+  cannot be framed because JupyterLab sends `frame-ancestors 'self'`.
+- **Several notebooks can be open, but not managed.** None can be renamed, closed or deleted; export
+  writes the page you are looking at.
+- **Output support is a chosen subset.** `application/json`, LaTeX and arbitrary MIME types are shown
+  as placeholders; HTML is sanitized, so outputs that rely on their own scripts render statically.
+- **Panel notes arrive at the next step.** A queued note is context for the next model request, not a
+  message sent on the user's behalf.
+- **Code execution only.** The Contents API (reading and writing notebook files on the server) is not
+  exposed.
+- Kernels are left running when a conversation ends; shut them down with `jupyter_kernel`.

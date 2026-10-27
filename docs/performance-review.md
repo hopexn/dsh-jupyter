@@ -2,13 +2,13 @@
 
 日期：2026-10-23
 对象：`@local/dsh-jupyterlab` 0.1.0（改造前快照 `cf1f252`）
-环境：macOS，Jupyter Server 2.21.1 @ `http://aimax395.local:9002/lab`（192.168.5.200），密码认证
+环境：macOS，Jupyter Server 2.21.1 @ `http://jupyterbox.local:9002/lab`（10.0.0.10），密码认证
 
 ## 结论先说
 
 **"慢"不是插件逻辑慢，是 DNS 慢。**
 
-`aimax395.local` 是 mDNS 名字。macOS 上解析它一次要 **约 5.02 秒**：`mDNSResponder` 先发多播
+`jupyterbox.local` 是 mDNS 名字。macOS 上解析它一次要 **约 5.02 秒**：`mDNSResponder` 先发多播
 查询（还要重试），失败后才回落到 `/etc/hosts`。而 `fetch` 和内置 `WebSocket` **每条连接都会自己
 解析一次**，解析器不可注入 —— 于是插件里**每一次 HTTP 请求**都白付 5 秒。
 
@@ -26,10 +26,10 @@
 补充证据（改前，直接打网络层）：
 
 ```
-tcp connect 到 aimax395.local:9002     5020 ms   （每次新建连接都是）
+tcp connect 到 jupyterbox.local:9002    5020 ms   （每次新建连接都是）
 dns lookup                             5006 ms
 curl 走已建好的连接                      10 ms
-按 IP 直连 192.168.5.200                12 ms
+按 IP 直连 10.0.0.10                    12 ms
 ```
 
 另外两条路都走不通，这也是为什么必须换传输层而不是"改成连 IP"：
@@ -160,11 +160,11 @@ runCell answered after 22 ms (still running: true)
 - **`jupyter_status` 的 `version` 恒为空**：`/api/status` 在 jupyter_server 2.x 上确实没有这个
   字段，`/api/version` 是 404；但 **`GET /api` 返回 `{"version":"2.21.1"}`**。改成并行取
   `/api`，实测输出 `version: "2.21.1"`。
-- **`/etc/hosts` 别名**：环境里 `/etc/hosts` 只有 `192.168.5.200 aimax395.local`，不带 `.local`
+- **`/etc/hosts` 别名**：环境里 `/etc/hosts` 只有 `10.0.0.10 jupyterbox.local`，不带 `.local`
   的名字仍未定义，而改 hosts 需要 root。给了幂等脚本 `scripts/alias-host.sh`（自动备份，
   `dscacheutil -flushcache` + `killall -HUP mDNSResponder`），一条命令即可：
-  `sudo scripts/alias-host.sh aimax395 192.168.5.200`。**这条没有在本机执行**（沙箱里 sudo 不可用），
-  需要你自己跑一次，然后把 `url` 换成 `http://aimax395:9002/lab`。
+  `sudo scripts/alias-host.sh jupyterbox 10.0.0.10`。**这条没有在本机执行**（沙箱里 sudo 不可用），
+  需要你自己跑一次，然后把 `url` 换成 `http://jupyterbox:9002/lab`。
 
 ### 测试
 
