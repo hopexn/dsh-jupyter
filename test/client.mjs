@@ -575,6 +575,63 @@ await check('an image output renders from its stored URL', () => {
   assert.equal(images[0].props.loading, 'lazy', 'a long notebook must not fetch every plot at once')
 })
 
+await check('an image that fails to paint is fetched through the host channel', async () => {
+  const rendered = renderCell(page, cellOf({
+    outputs: [{ type: 'image', mime: 'image/png', url: 'api/jupyterlab/asset?name=abc.png' }],
+  }))
+  const img = renderOutputs(rendered).find((node) => node.type === 'img')
+  const calls = []
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return {
+      ok: true,
+      status: 200,
+      blob: async () => new Blob([new Uint8Array([137, 80, 78, 71])], { type: 'image/png' }),
+    }
+  }
+  try {
+    const target = {
+      dataset: {},
+      src: '',
+      getAttribute: () => 'api/jupyterlab/asset?name=abc.png',
+      ownerDocument: { createElement: () => ({ setAttribute() {}, textContent: '' }) },
+      replaceWith() { throw new Error('the retry succeeded, so nothing should be replaced') },
+    }
+    img.props.onError({ currentTarget: target })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.deepEqual(calls, ['api/jupyterlab/asset?name=abc.png'],
+      'the fallback must use the same document-relative host route the panel already uses')
+    assert.match(target.src, /^data:image\/png;base64,/, 'the bytes must be embedded as a data URL')
+  } finally {
+    delete globalThis.fetch
+  }
+})
+
+await check('an image that cannot be fetched says so instead of staying broken', async () => {
+  const rendered = renderCell(page, cellOf({
+    outputs: [{ type: 'image', mime: 'image/png', url: 'api/jupyterlab/asset?name=gone.png' }],
+  }))
+  const img = renderOutputs(rendered).find((node) => node.type === 'img')
+  let replaced
+  globalThis.fetch = async () => ({ ok: false, status: 404 })
+  try {
+    const target = {
+      dataset: {},
+      src: '',
+      getAttribute: () => 'api/jupyterlab/asset?name=gone.png',
+      ownerDocument: { createElement: () => ({ className: '', textContent: '', setAttribute(name, value) { this[name] = value } }) },
+      replaceWith(node) { replaced = node },
+    }
+    img.props.onError({ currentTarget: target })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.ok(replaced !== undefined, 'a failed image must be replaced by a status line')
+    assert.match(replaced.textContent, /HTTP 404/)
+  } finally {
+    delete globalThis.fetch
+  }
+})
+
 await check('the panel opens one stream per session and renders what it pushes', async () => {
   const sources = installEventSource()
   const original = globalThis.fetch
