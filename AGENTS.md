@@ -66,8 +66,9 @@ notebook/ipynb/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器
    `KernelConnection.#queue`，不要另开并发路径。
 6. **大 payload 不进笔记本 JSON。** 图片走 `AssetStore` 换 URL；视图是每次点击都要重发的。
 7. **面板活动只走 `agent/pre-step` 的 notice。** 不要直接往会话 `append` 一条 user/message：
-   一条 note 不该凭空开出一轮对话，交付时机归 agent 决定；来源必须是 `kind:'plugin'`，
-   不能伪装成用户输入。模型自己经 `jupyter_notebook` 做的增删改必须传 `{ note: false }`，
+   一条 note 不该凭空开出一轮对话，交付时机归 agent 决定；来源必须是**生产者自己的** kind
+   （本插件是 `kind:'jupyterlab'`），**不能是 `'plugin'`**——会话格式 v4 会拒绝这个已退役的包装
+   （"format v4 message requires a producer-owned source kind"），也不能伪装成用户输入。模型自己经 `jupyter_notebook` 做的增删改必须传 `{ note: false }`，
    否则下一轮会把模型的动作描述成用户做的。
 8. **新格子只能靠 `insert` 事件出现。** `cell` 事件只更新已存在的格子——一个被删掉的格子不该
    被收尾事件重新加回来。`insert` 要带 `index`，客户端才能把它放在正确的位置。

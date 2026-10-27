@@ -14,12 +14,13 @@
 
 | 想改的东西 | 先读 | 主要文件 / 符号 | 对应测试 |
 | --- | --- | --- | --- |
-| 工具的参数、返回值、提示语 | §2.1 | `lib/index.js`: `connectTool` `statusTool` `executeTool` `notebookTool` `kernelTool` `PROMPT_TEXT` | `test/register.mjs` |
+| 工具的参数、返回值、提示语 | §2.1 | `lib/index.js`: `connectTool` `statusTool` `executeTool` `notebookTool` `kernelTool` `panelServer` `PROMPT_TEXT` | `test/register.mjs` |
 | 模型读/改面板里的单元格 | §2.1 §4.1 | `lib/index.js`: `notebookTool`；`lib/notebook.js`: `snapshot` `runCellNow` | `test/register.mjs` `test/notebook.mjs` |
 | agent 执行如何出现在面板里 | §2.4 | `lib/notebook.js`: `beginAgentRun` `#settle` | `test/notebook.mjs` |
 | 模型改写单元格后的 diff | §3.2 §4.6 | `lib/notebook.js`: `previousSource` `revertCell`；`lib/client.js`: `diffRows` | `test/notebook.mjs` `test/client.mjs` |
 | 连接地址、token/密码、URL 归一化 | §5.2 | `lib/server.js`: `normalizeJupyterUrl` `JupyterServerClient` | `test/e2e.mjs` |
-| 内核绑定、重连、绑定落盘 | §3.1 | `lib/runtime.js`: `JupyterRuntime` `sessionKernel` `ensureKernel` | `test/e2e.mjs` |
+| 多台服务器并存、面板里加/移除/绑定连接 | §3.1 §4.1 §4.6 §5.2 | `lib/connections.js`: `ServerRegistry` `ServerLink` `serverKey`；`lib/runtime.js`: `addServer` `removeServer` `servers` `setDefaultServer`；`lib/notebook.js`: `connectServer` `forgetServer` `bindServer` `activeServer`；`lib/client.js`: 服务器选择器与连接表单 | `test/e2e.mjs` `test/notebook.mjs` `test/client.mjs` |
+| 内核绑定、重连、绑定落盘 | §3.1 | `lib/runtime.js`: `JupyterRuntime` `ensureKernel` `sessionKernel` `#readState` `#writeState`；键格式 `<服务器>::<会话>` | `test/e2e.mjs` |
 | 执行协议（execute_request / iopub / 中断） | §2.2 | `lib/kernel.js`: `KernelConnection.execute` `#runOne` | `test/e2e.mjs` |
 | 出站 HTTP / DNS / WebSocket | §5.1 | `lib/transport.js` `lib/dns-cache.js` `lib/websocket.js` | `test/transport.mjs` |
 | 面板命令与视图字段 | §3.2 §4.1 | `lib/notebook.js`: `Notebooks.command` `Notebooks.view` | `test/notebook.mjs` |
@@ -54,12 +55,18 @@ rg -n 'action: .runCell.|STREAM_ROUTE' lib/ test/
 DSH 宿主进程（Node，有依赖）
   lib/index.js ─ tools ─> lib/runtime.js ─> lib/kernel.js ─> lib/websocket.js
                                 │                  │
+                     lib/connections.js           │
+                     （ServerRegistry：            │
+                       多台服务器的键与凭据）        │
                                 └─> lib/server.js ─┴─> lib/transport.js ─> lib/dns-cache.js
   lib/routes.js （connection.fetch）─> lib/notebook.js ─> lib/assets.js
                                               ▲
                                               │ SSE / fetch
 浏览器（无构建、无第三方包）  lib/client.js ───┘
 ```
+
+一个会话可以有**多台**服务器：`connections.js` 是它们的注册表，`runtime.js` 按
+`<服务器>::<会话>` 绑内核，`notebook.js` 的每一页存着它跑在哪台服务器上。
 
 三条外部约束，任何改动都不能违反：
 
@@ -83,11 +90,12 @@ DSH 宿主进程（Node，有依赖）
 
 ```
 index.executeTool
-  └─ runtime.execute(sessionKey, code, {signal, timeoutMs, storeHistory})
-       └─ ensureKernel（首次启动，之后复用绑定）
-            └─ KernelConnection.execute
-                 └─ summarizeOutputs(outputs) → {stdout, result, stderr, error}
-                      └─ saveArtifacts → $DSH_HOME/jupyterlab/artifacts/jupyter-<stamp>-NN.<ext>
+  └─ server = args.server ?? notebooks.activeServer(sessionKey)?.key   // 面板当前页那台
+       └─ runtime.execute(sessionKey, code, {server, signal, timeoutMs, storeHistory})
+            └─ ensureKernel(sessionKey, {server})（首次启动，之后复用绑定）
+                 └─ KernelConnection.execute
+                      └─ summarizeOutputs(outputs) → {stdout, result, stderr, error}
+                           └─ saveArtifacts → $DSH_HOME/jupyterlab/artifacts/jupyter-<stamp>-NN.<ext>
 ```
 
 - **一次性返回，不流式。** 工具面对模型是"一问一答"，中途推消息只会在 transcript 里留下碎片。
@@ -99,7 +107,9 @@ index.executeTool
   base64 与 UTF-8 分开写。
 - **每次执行都留一个单元格。** `notebooks.beginAgentRun` 在发代码前插入 `origin: 'agent'` 的格子，
   `onOutput` 把 iopub 直接推进面板（与用户点 Run 同一套补丁），结束时 `#settle` 用权威输出重算。
-  没有 agent 会话的调用（`sessionKey` 落到 `shared`）不写面板。
+  没有 agent 会话的调用（`sessionKey` 落到 `shared`）不写面板。格子只记「模型跑了什么」，不记
+  `server` 字段：哪台服务器由工具返回值和面板那一页的绑定说明；显式 `server` 与页面绑定的服务器
+  不同时，格子仍记在当前页（它记录的是这段分析，不是内核清单）。
 - **`jupyter_notebook` 是另一半。** 它读的是**面板的模型**，不是内核历史：`snapshot` 给出格号、
   id、`rev`、源码与输出摘要；`add/update/delete` 走 `command(..., { note: false })`，`run` 走
   `runCellNow`（同一个 `#beginCodeRun`，等结果而不是立即返回）。模型自己的动作**不产生用户 note**，
@@ -141,10 +151,18 @@ client onRun ─ POST {action:'runCell', id, source}
 
 - **只在下一步交付。** 编辑不是一轮对话的开始：`pre-step` 里 `step === 1` 且
   `decision.messages` 为空时直接跳过，note 留在缓冲里等下一轮；被拒或被取消的 step 也不消费。
-- **来源是插件，不是用户。** `source: {kind:'plugin', plugin:'jupyterlab', form:'notice'}`，
-  模型和界面都不会把它当成用户说的话——这是一条"刚才发生了什么"的上下文，不是指令。
+- **来源是插件，不是用户。** `source: {kind:'jupyterlab', form:'notice', summary}`：`kind` 用
+  插件自己的名字，**不是** `'plugin'`。会话格式 v4 明确拒绝 `{kind:'plugin', plugin:…}` 这个
+  已退役的包装（"format v4 message requires a producer-owned source kind"），第一次交付 note 时
+  会让整轮失败；v4 自己的 v3→v4 迁移也把 `plugin:'time-context'` 改写成 `kind:'time-context'`。
+  `form:'notice'` + `summary` 才是"折叠的上下文行"，模型和界面都不会把它当成用户说的话。
 - **按 key 收敛。** 同一格的 `run-start` 被 `run-end` 覆盖（只留结果），`reset` 会清空所有待发
-  note，因为它描述的单元格已经不存在；`moveCell`、`setPath` 不产生 note。
+  note，因为它描述的单元格已经不存在；`moveCell`、`setPath` 不产生 note。`connectServer`、
+  `bindServer`、`forgetServer` 共用 key `server`：它们描述的是连接列表，只有最新一条值得交付。
+- **换服务器必须说出来。** 页面切到另一台服务器就是换了一个内核：变量、导入、打开的文件都不在。
+  `switchNotebook` / `newNotebook` 的 note 只在目标页的服务器与原来那页不同时补一句，`bindServer`
+  的 note 则始终说明这一点。`#servers`（每个会话最后一次指向的服务器）在 note 缓冲之外维护，
+  因为一次 drain 不能抹掉「上一页在哪台机器上」这个比较基准；宿主给的 `previousServer` 优先于它。
 - **预算。** 每会话最多 8 条 / 6000 字符；单条源码 900 字符、输出 800 字符；超了丢最旧的，
   单条超长在消息里截断。
 - **第一批发地图。** 会话第一次交付 note 时，`Notebooks.outline` 生成一行一格的大纲（格号、
@@ -173,17 +191,24 @@ jupyter_execute
 
 ## 3. 状态模型
 
-### 3.1 内核绑定（宿主，按会话）
+### 3.1 连接与内核绑定（宿主，按会话）
 
-`JupyterRuntime` 持有**一个**连接（`jupyter_connect` 会切换它），内核按 DSH 会话绑定：
+两台服务器可以同时连着。**注册表**（`ServerRegistry`）管键与凭据，**运行时**（`JupyterRuntime`）
+管内核，内核按 `<服务器>::<DSH 会话>` 绑定：
 
 | 关注点 | 实现 |
 | --- | --- |
-| 绑定存哪 | `$DSH_HOME/jupyterlab/kernels.json`，键是 `<url>::<会话 id>`，按服务器隔离 |
-| 重启后 | 读绑定 → `GET /api/kernels/<id>` 验证 → 活着就 attach，死了才新建 |
-| 地址变更 | `configure()` 清掉不匹配主机的凭证与绑定；换服务器不可能泄露旧 token |
-| 状态查询 | 面板的状态行用 `maxAgeMs: 2000` 的 memo；工具调用不 memo（默认 0），内核动作时失效 |
-| 解析预热 | 挂载时在后台跑一次 `resolveHost`，把唯一那 5 s 从首次执行挪到加载时 |
+| 服务器身份 | `serverKey(url)` = 归一化后的 baseUrl（`http://host:9002`，无 `/lab`、无结尾斜杠）。注册表键、页面绑定、工具参数、镜像前缀全部用它；任何写法（带 `/lab`、带 `?token=`、无 scheme）都归一到同一个键 |
+| 凭据归属 | 每台服务器一份，`ServerLink` 自己懒建 `JupyterServerClient`；新增连接从不复用另一台的 token/密码。`describe()` 只给 key/url/name/label/authMode/hasCredentials，永远没有凭据 |
+| 显示名称 | `name` 只是标签（设置里给、面板表单里填，随 `servers.json` 持久化），**不参与身份**：同一个 key 换名字仍是同一台服务器；面板的选择器与列表优先显示它，完整地址留在 tooltip |
+| 连接存哪 | `$DSH_HOME/jupyterlab/servers.json`（权限 `0600`，`tmp + rename`，坏文件当空表）。**只存运行时添加的**（面板表单、`jupyter_connect`）；来自 profile 配置的连接每次启动重新生效，不写进这个文件——否则从配置里删掉它也删不掉 |
+| 来源顺序 | persisted → `config.servers`（数组，按顺序）→ 单台 `config.url`（并成为默认）。同一个键后到的覆盖先到的凭据 |
+| 默认连接 | 第一台添加的成为默认；`jupyter_connect` 把新连接设成默认；没有默认时 `resolve(undefined)` 报 `JUPYTER_NOT_CONFIGURED` 并列出已连接的服务器 |
+| 绑定存哪 | `$DSH_HOME/jupyterlab/kernels.json`，键是 `<服务器>::<会话 id>`。旧版（单服务器）的原始地址键仍然读得到：读时按后缀 `<会话>` 扫描、前缀归一化后比对，写时统一成规范键并删掉旧拼写 |
+| 重启后 | 读绑定 → `GET /api/kernels/<id>` 验证 → 活着就 attach，死了才新建。**按服务器各自验证**，互不影响 |
+| 移除连接 | `removeServer()` 关掉这台服务器在**所有会话**上的信道，并删掉它所有的 `kernels.json` 条目；服务器上的内核照旧活着，之后可以重新加回来 attach |
+| 状态查询 | 面板的状态行用 `maxAgeMs: 2000` 的 memo（按 `<服务器>::<会话>` 键）；工具调用不 memo（默认 0），内核动作时失效 |
+| 解析预热 | 每次添加连接（含挂载时）在后台跑 `resolveHost`，把唯一那 5 s 从首次执行挪到加载时 |
 
 ### 3.2 笔记本（宿主，按会话）
 
@@ -191,16 +216,23 @@ jupyter_execute
 
 | 私有字段 | 内容 | 生命周期 |
 | --- | --- | --- |
-| `#notebooks` | 会话 → `{active, docs: Map<名字, {name, cells, path, revision}>}`（下称"书桌"） | 首次访问时从镜像加载 |
+| `#notebooks` | 会话 → `{active, docs: Map<名字, {name, cells, path, revision, server}>}`（下称"书桌"） | 首次访问时从镜像加载 |
 | `#pendingPersistence` | 会话 → 延迟写盘的 timer | 大笔记本 60 ms 合并写 |
 | `#listeners` | 会话 → SSE 订阅者集合 | 流断开即移除 |
 | `#runs` | 会话 → 在飞的 Promise 集合 | `idle()` / `dispose()` 等它 |
 | `#runningAll` | 会话 → `{stop, notebook}` | 全量运行的停止标志；`dispose()` 会把它们全部置位 |
 
 **一个会话是一个书桌，不是一本笔记本。** 面板顶部可以换页、也可以新开一页：每页有自己的
-`cells / path / revision`，共用同一个内核（内核按会话绑定，见 §3.1）。`#notebook(session)` 返回
-`active` 那一页，命令和 `view()` 都只作用于它；`#peek(session)` 是同一个东西但不创建会话，
-留给只读路径（`snapshot` `outline` `notebookPath`）。
+`cells / path / revision / server`。`server` 是这一页绑定的服务器键（`null` 表示跟随默认连接）；
+同服务器的页共用一个内核，不同服务器的页各有自己的内核（内核按 `<服务器>::<会话>` 绑定，
+见 §3.1）。`#notebook(session)` 返回 `active` 那一页，命令和 `view()` 都只作用于它；
+`#peek(session)` 是同一个东西但不创建会话，留给只读路径（`snapshot` `outline`
+`notebookPath` `activeServer`）。
+
+**`server` 是页面的绑定，不是进程的。** 新页继承开它时那一页的服务器（`+ 新建` 是「我在做的事
+的下一页」，不是「从默认服务器重新开始」）；`bindServer` 显式改绑定，`null` 只在**旧镜像**里
+出现（升级前的页面），读成「跟随默认」，与单服务器时代的行为一致。绑定与文档一起写进镜像，
+所以重启不会把笔记本悄悄挪到另一台机器上。
 
 - **上限 12 本**（`MAX_NOTEBOOKS`）。每一本都是镜像文件里的一个文档，无上限地开会把这个文件
   撑成没人找得回来的垃圾场。到顶时命令直接报错，不静默丢一页。
@@ -234,7 +266,8 @@ jupyter_execute
 否则停止按钮会一直亮着。
 
 **落盘。** `isHeavy()` 只看长度不序列化；轻的立即写，重的延迟 60 ms 合并写；跑之前和
-`dispose()` 强制落盘。写文件是 `tmp + rename`，紧凑 JSON（缩进对大 payload 是纯浪费）。
+`dispose()` 强制落盘。写文件是 `tmp + rename`，紧凑 JSON（缩进对大 payload 是纯浪费）。每一页的
+`server` 与 `active` 一起原子写：崩在两次写之间不能打开错的那一页，也不能把页面绑到错的主机。
 
 **事件表**（SSE 的 `data:`，也是 `applyEvent` 的输入）：
 
@@ -244,7 +277,7 @@ jupyter_execute
 | `cell` | `revision` + 完整 cell | 开始/结束的权威状态；不合并，立即下发 |
 | `replace` | `revision` + 完整 cells 列表 | 导入 `.ipynb`：整本换掉，一帧而不是一格一帧 |
 | `runall` | `running` + `revision` | 全量运行开始/结束；不改格子，也不改 revision |
-| `notebook` | `notebook`（新页名字） | 换页/新开：换了文档，客户端重读整份视图而不是给列表打补丁 |
+| `notebook` | `notebook`（新页名字）+ `server`（该页解析后的服务器键） | 换页/新开/绑定/连接或移除连接：都是「客户端必须重读整份视图」的变化，补丁表达不了（可能是另一份文档，也可能换了一台主机） |
 | `append` | `cellId` + 一条 output | 新增输出（text/html/markdown/image/error） |
 | `text` | `cellId` + `index` + `text` | 向第 index 条输出追加文本 |
 | `clear` | `cellId` | 内核 `clear_output` |
@@ -268,8 +301,11 @@ jupyter_execute
 | `moveCell` | 与相邻格交换（`delta: ±1`） | 越界静默 |
 | `clearOutput` | 清一个格子的输出 | |
 | `clearAllOutputs` | 清全部 | |
-| `newNotebook` | 新开一页并切过去 | 名字由 `uniqueName()` 起；到 `MAX_NOTEBOOKS` 报错；会停全量运行 |
+| `newNotebook` | 新开一页并切过去 | 名字由 `uniqueName()` 起；到 `MAX_NOTEBOOKS` 报错；会停全量运行；可选 `server`（缺省继承当前页的绑定） |
 | `switchNotebook` | 切到 `notebook` 指定的那一页 | 名字不存在就报错，不新建；会停全量运行 |
+| `connectServer` | 加一个连接并 probe 它 | `{url, name?, token?, password?, username?, cookie?, kernelName?}`；失败时宿主把刚加的那条删掉再抛错，选择器里不留死条目；成功后发 `notebook` 事件 |
+| `forgetServer` | 移除一个连接 | `{server}`；关掉本进程到它的信道、删它的内核绑定；绑定它的页**保留键**、显示未连接，绝不回退到别的服务器 |
+| `bindServer` | 把当前页绑到另一台已连接的服务器 | `{server}`；未知服务器报错；会停全量运行；发 `notebook` 事件 |
 | `runCell` | 保存草稿并执行（markdown 直接渲染） | 立即返回，输出走 SSE |
 | `runAll` | 顺序执行所有非空 code 格 | 立即返回；`stopOnError` 可选；停止靠 `interrupt` 或 `stopRunAll` |
 | `importNotebook` | 用 `.ipynb` 的 JSON 替换（`mode:'append'` 则追加） | 整本一个 `replace` 事件；无法保留的内容放进 `message` |
@@ -294,6 +330,10 @@ jupyter_execute
   原位，而 4xx/5xx 会被 `callHost` 当成传输故障处理。
 - **命令不带 `request.signal`。** 带着它，用户刷新页面就等于取消命令；`runCell` 更糟——中断会
   一路传到 `POST /interrupt`，把正在跑的单元格杀掉。`runCell` 不再等待执行之后，这条尤其重要。
+- **视图带连接信息。** `view()` 带上 `server`（当前页解析后的键）、`serverUrl`、`serverConnected`、
+  `defaultServer`、`configured` 和 `servers`（describe 列表：key/url/label/authMode/hasCredentials/
+  default，**没有凭据**）。路由把 `connectionInfo()` 合并进每一个答复，包括 `?since=` 命中的短答
+  案和错误答复：连接集合可以在任何格子都没变的情况下改变，而面板必须还能画出选择器。
 - **注册走 `ctx.inject(['connection'])`。** 冷启动时 `connection` 往往还没提供；只读一次就放弃
   的症状是"面板能开，但所有请求 404"。状态通过 `onState` 上报，`jupyter_status` 里能看到。
 - **流的生命周期挂在请求的 abort 上**：释放订阅、清心跳、关 body。反复开关面板不留东西。
@@ -395,6 +435,27 @@ dataUrl}`），客户端两种都认。
   读成 `main` 的草稿——升级不该丢掉唯一那段没保存的文字。
 - **换页在工具栏上，只有一个控件。** `dshj-picker` 列出 `view.notebooks`，选中的是 `view.notebook`；
   `+ 新建` 发 `newNotebook` 并让宿主起名字。笔记本的名字只在这里出现，别处再显示一遍就是重复。
+- **服务器有两个控件：选择器与连接面板。** 选择器（`dshj-server`）的值是 `view.server`，选项是
+  `view.servers` 的 label，改它就是 `bindServer`；没有连接时禁用并显示「未连接」。`连接…`
+  展开头部下面的连接面板：已连接列表（label + 认证方式 + `移除`）和添加表单（地址、认证方式、
+  名称、凭据、可选的**代理 Cookie** 多行框，用于 SSO/访问代理）。认证方式有三项：
+  `password`（默认，大多数部署的常见情况）/ `token` / `cookie`（仅代理 Cookie，不发 token/密码）。
+  **没有用户名字段**：Jupyter 忽略它，问了只是多一行；协议里的 `username` 保留给配置/工具。
+  表单是两列带标签的网格（地址与 Cookie 独占整行），不是一排只有 placeholder 的输入框。
+  连接列表每行显示名称 + 地址（第二行小字）+ 认证方式 chip + `编辑` + `移除`，同一行不再重复地址。
+  回环地址（`localhost`/`127.0.0.1`/`[::1]`）没有自定义名称时显示 `localhost`：选择器是扫一眼读的，
+  一串 IP 不如这个词。表单是唯一存在凭据的地方：只进 `connectServer` 的 POST body，
+  关闭即清空，绝不写 `sessionStorage`、草稿或 URL。连接失败时表单保持打开，宿主的错误走已有的
+  错误横幅。
+- **文案短。** 头部和表单只说必要的信息：内核行没有内核时是「未启动内核」，不再附一句「运行任意
+  单元格即可启动」——那是一句每个新用户只会读一次、之后一直占位置的说明。长解释放在 `title`/
+  tooltip 里，可见文本保持一行。
+- **编辑不换身份。** 连接列表的 `编辑` 把一条连接装回表单，但地址与认证方式固定：换地址就是换
+  服务器，应当移除重加。名称与凭据可改，**留空表示保持已存的值**（宿主从不把已存 secret 发回浏览
+  器）；提交仍走 `connectServer`，同一个 `url` 就是更新。
+- **绑定失效的页仍然渲染。** `view.serverConnected === false` 时内核行显示「未连接」并用错误色；
+  单元格照常可读可改，`运行` 照常发命令——宿主那句「没有这个已连接的服务器」才是真正有用的信息，
+  客户端不该替它回退到别的服务器上。
 - **长输出默认折叠**：纯文本超过 24 行或 4000 字符、HTML 超过 2000 字符时加一层
   `Collapsible`（`data-open` + 一行渐变），展开状态留在组件本地。`useState` 在早退分支之前
   调用，所以输出在运行中越过阈值时组件不会重挂、已展开的不会被折回去。
@@ -495,9 +556,23 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | --- | --- | --- |
 | token | `Authorization: token <t>` | 优先；URL 里的 `?token=` 自动提取 |
 | password | `GET /login` 取 `_xsrf` → `POST /login` → 带 cookie | 需要 `X-XSRFToken` 才能启动内核 |
+| cookie | 每次 REST 与内核 WebSocket 升级都带粘进来的 `Cookie` 头；其中的 `_xsrf` 作为 `X-XSRFToken` | 用于 Jupyter 前面的 SSO/访问代理；可单独作为凭据，也可与 token/密码叠加；和 token/密码一样随连接写进 `servers.json`（`0600`），`describe()` 仍然不暴露它 |
 | 密码哈希 | 不支持 | `argon2:...` 不可重放，只能报错 |
 
-凭证属于主机：`configure()` 在主机变化时清空旧 token/password，除非同一次调用给了新的。
+**302 是一个单独的错误类别。** 代理会把未认证的请求重定向到它的登录页，响应体是一张 HTML 登录页；
+把 HTML 当错误正文读会误导人（而且 401/403 的修法完全不同）。所以 3xx 单独映射成
+「请求没到 Jupyter，前面有 SSO/访问代理」并给出 `Location` 的主机名，提示粘贴浏览器 Cookie 或换
+直达地址——这是唯一一种"凭据对不对都不重要"的失败。
+
+凭证属于主机，而不是进程：注册表里的每条连接只持有自己的 token/password/cookie，新增一条从不
+复用另一条的凭据（`ServerLink.update` 只在**同一链接的地址变了**时才丢掉不匹配的旧凭据）。
+`cookie` 是**会话**凭据，但和其他凭据一样持久化：重启后直接复用，直到网关会话过期（下一次请求
+会以 302/401 报错，面板里 `编辑` 换一个新的）。
+`jupyter_connect` 的 `configure()` 是单服务器时代的兼容入口：有 `url` 就加/更新那条连接并设为
+默认，没有就更新默认连接；`forgetKernels` 只释放**这台**服务器的会话内核。
+
+凭据落盘只有两处，都是明文：profile YAML，和 `$DSH_HOME/jupyterlab/servers.json`（`0600`）。
+后者只写运行时添加的连接——配置里点名的服务器每次启动重新生效，不进这个文件。
 
 ### 5.3 错误码
 
@@ -521,6 +596,10 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | 资源名不存在 | 404（不是 500）；名字必须匹配 `^[0-9a-f]{20}\.(png|jpg|gif|webp|svg|pdf)$` |
 | 面板路由没注册 | `onState('unavailable')`，工具照常可用，`jupyter_status` 里可见 |
 | 镜像写不进去 | 静默忽略；编辑不能因为只读 home 而失败 |
+| 工具/面板点名了未知服务器 | `JUPYTER_NOT_CONFIGURED`，消息里列出已连接的服务器；绝不静默回退默认连接 |
+| 页面绑定的服务器被移除 | 页面照常渲染（`serverConnected: false`，内核行显示未连接），下一次运行报上面那条错 |
+| 新连接 probe 失败 | `connectServer` 把刚加的条目删掉再抛错，选择器里不留死连接 |
+| 移除连接时还有内核信道 | `removeServer()` 关掉该服务器在所有会话上的信道并删掉 `kernels.json` 里它的条目；服务器上的内核继续运行，可重新加回 attach |
 
 ---
 
@@ -541,13 +620,14 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | 文件 | 职责 | 关键导出 |
 | --- | --- | --- |
 | `lib/index.js` | Cordis 插件：Config、系统提示、五个工具、接线 | `apply` `Config` |
-| `lib/runtime.js` | 连接与会话内核状态：绑定、重连、镜像 | `JupyterRuntime` `normalizeSettings` |
-| `lib/server.js` | REST 客户端：URL、认证、XSRF、cookie | `JupyterServerClient` `normalizeJupyterUrl` `JupyterError` |
+| `lib/connections.js` | 服务器注册表：键、名称、凭据、describe 列表、`servers.json` 持久化 | `ServerRegistry` `ServerLink` `serverKey` `serverLabel` `normalizeServerSettings` |
+| `lib/runtime.js` | 每服务器每会话的内核状态：绑定、重连、镜像 | `JupyterRuntime` `normalizeSettings`（兼容 re-export） |
+| `lib/server.js` | REST 客户端：URL、token/密码/**代理 cookie** 认证、XSRF、cookie 罐 | `JupyterServerClient` `normalizeJupyterUrl` `JupyterError` |
 | `lib/transport.js` | 出站 HTTP（keep-alive、缓冲、abort） | `httpRequest` `combineSignals` |
 | `lib/dns-cache.js` | 进程级解析缓存 | `resolveHost` `createLookup` |
 | `lib/websocket.js` | RFC 6455 客户端（够用即可） | `KernelSocket` |
 | `lib/kernel.js` | 内核消息协议、输出归一化、产物落盘 | `KernelConnection` `summarizeOutputs` `collectArtifacts` |
-| `lib/notebook.js` | 面板模型：单元格、增量渲染、后台运行、镜像 | `Notebooks` `OutputRenderer` `renderableOutputs` |
+| `lib/notebook.js` | 面板模型：单元格、增量渲染、后台运行、镜像、页面的服务器绑定 | `Notebooks` `OutputRenderer` `renderableOutputs` |
 | `lib/ipynb.js` | `nbformat` 4 的读写（纯函数，无 I/O） | `notebookToIpynb` `ipynbToCells` |
 | `lib/activity.js` | 面板活动的缓冲与交付：note 文案、批量消息、`agent/pre-step` 钩子 | `NotebookActivity` `messageForNotes` `registerContextInjection` |
 | `lib/assets.js` | 内容寻址图片仓库 | `AssetStore` `assetUrl` |
@@ -565,8 +645,8 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
 | `test/notebook.mjs` | 命令、视图、增量渲染、SSE、资源路由、镜像 | 否（注入假 execute） |
 | `test/activity.mjs` | note 文案、批量消息、`agent/pre-step` 的交付与守卫 | 否（假 agent 与假 ctx） |
 | `test/client.mjs` | 注册、渲染路径、点击、流式补丁、memo 身份、高亮语言、键盘、aria | 否（假 React 装载，不跑真实 DOM） |
-| `test/e2e.mjs` | 认证、执行、持久化、超时、内核生命周期 | **是** |
-| `test/register.mjs` | 真 cordis 上下文 + 真 tools 注册表 | 部分（挂载即可） |
+| `test/e2e.mjs` | 认证、执行、持久化、超时、内核生命周期；多连接（两条键、各自内核、绑定/移除、`servers.json` 与 `kernels.json` 语义、配置连接不落盘） | **是** |
+| `test/register.mjs` | 真 cordis 上下文 + 真 tools 注册表；`Config.servers`、`server` 参数、在两条连接上执行 | 部分（挂载即可） |
 
 跑法见 `README.md` 的 "Verifying a change"。改宿主半边的协议行为，`e2e` 必须跑；
 只改渲染，`client` + `notebook` 就够。**不要**用 `disable_check_xsrf` 起测试服务器——它会
@@ -587,9 +667,13 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
   单独取消（停止是"跑完这格",中断是"杀掉这格"两个动作）。
 - 草稿存在标签页里（`sessionStorage`）：换标签页、换设备都看不到，这是有意的——它是打字中的
   东西，不是文档。草稿按笔记本分开存，所以换页不丢草稿。
-- **多本笔记本只做到"开着"**：不能重命名、不能关闭、不能删页，也没有"每本绑不同内核"。
-  换页之后内核还是同一个，变量与导入都还在——这是共享内核的直接结果，不是遗漏（§3.1）。
-  导出只导当前这一页；非 `main` 的页用名字当下载文件名。
+- **多本笔记本只做到"开着"**：不能重命名、不能关闭、不能删页。每一页绑定一台服务器，绑定在
+  同一台服务器上的页共用那台的内核（变量与导入跨页带过去），绑定到另一台服务器的页是另一个
+  内核——"每页各绑服务器"是有的，"同一页跨服务器共享变量"是不存在的。导出只导当前这一页；
+  非 `main` 的页用名字当下载文件名。
+- **多台服务器，但没有"分组"或"每台默认内核池"**：默认连接是全局的（由 `jupyter_connect` 或
+  `config.url` 决定），面板只能改**当前页**的绑定，不能改默认；也没有"把某台服务器从所有会话
+  摘掉"之外的批量操作。
 - 输出只画图片、`text/html`、`text/markdown`、纯文本；`application/json`、LaTeX 只报 MIME 名。
 - HTML 输出经清洗，所以依赖自身 `<script>` 的东西（交互 widget、plotly）只画静态部分。
 - `jupyter_execute` 不流式：模型一次拿全结果更省轮次；长任务的进度看面板。
@@ -599,7 +683,16 @@ macOS 上解析一次 `host.local` 约 5 s（`mDNSResponder` 先多播再回落 
   一部分；代价是一次探索很长的会话会让笔记本变长，暂时不做折叠或清理。
 - `jupyter_notebook` 的 `run` 会等结果（工具调用需要一个答案），而面板的 `Run` 立即返回
   （用户需要看到输出在长跑时流出来）。同一个 `#beginCodeRun`，两种等待策略。
-- 一个大内核一个会话绑定；跨会话共享内核属于能力扩展，不在当前范围。
+- 内核按 `<服务器>::<会话>` 绑定：一个会话在每台服务器上各有一个内核，两个会话即使连同一台
+  服务器也各有一个。跨会话共享内核属于能力扩展，不在当前范围。
+- **远端服务器必须从 Harness 所在机器可直接访问**：没有 SSH 隧道/端口转发，只监听对方
+  `127.0.0.1` 的 Jupyter 连不上。`.local`/`.internal` 名字、可路由 IP、带路径前缀的反向代理都行。
+- **凭据是明文文件，且没有凭据编辑 UI**：`servers.json` 权限 `0600`（与 profile YAML 同级），
+  没有钥匙串集成；面板能加、能移除，但不能预填修改某条连接的 token/密码（用同一地址再提交一次
+  会在宿主侧更新它），也不能改它的 `kernelName`。来自配置的连接在面板里移除只到下次重启——
+  配置会把它加回来。代理 Cookie 随连接持久化；网关会话过期后由服务端的报错提醒重填。
+- **代理 Cookie 能不能用取决于网关**：插件只负责把它带到每个 REST 请求和内核握手上；如果网关
+  把会话绑在浏览器指纹/设备上，重放仍会 302，那就必须走可直连地址或平台的服务 token。
 - 虚拟滚动没做：`memo` 之后每帧只重渲染一格，收益不足以引入行高测量与滚动同步。
 
 ---

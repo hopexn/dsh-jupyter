@@ -2,10 +2,14 @@
 
 [English](README.md) · 简体中文
 
-一个把 DeepSeek Harness 接到 Jupyter 服务器上的插件包。给它一个 JupyterLab 地址——比如
-`http://aimax395.local:9002/lab`——模型就能在一个**常驻的远端内核**里运行代码：变量、导入和
-工作目录在多次工具调用之间都还活着，于是一段对话可以像一次 notebook 会话那样，把分析一层层
-搭起来。
+一个把 DeepSeek Harness 接到**一台或多台 Jupyter 服务器**上的插件包。给它一个 JupyterLab
+地址——比如 `http://aimax395.local:9002/lab`——模型就能在一个**常驻的远端内核**里运行代码：
+变量、导入和工作目录在多次工具调用之间都还活着，于是一段对话可以像一次 notebook 会话那样，
+把分析一层层搭起来。
+
+本地的服务器和远端机器可以同时连着，各自用自己的凭据。面板里的每一页笔记本绑定到其中一台，
+这一页的代码就在那台机器上跑。连接可以是模型加的（`jupyter_connect`），也可以是你在面板的
+连接表单里加的：先填地址，再填 token 或密码。
 
 这里没有任何东西在本地执行：插件直接用 `fetch` 和一个 WebSocket 讲 Jupyter Server 的 REST API
 与内核消息协议，没有 Python、没有 `jupyter_client`，除了 DSH 自己带的包以外也没有任何 npm 依赖。
@@ -14,15 +18,17 @@
 
 | 工具 | 作用 |
 | --- | --- |
-| `jupyter_connect` | 让 Harness 指向一个 JupyterLab 地址并验证凭据。会归一化 `/lab`、`/tree` 和 `?token=...`；报告服务器版本、kernelspec 和正在运行的内核。 |
-| `jupyter_status` | 连接状态、服务器版本、kernelspec、运行中的内核，以及这段对话绑定在哪个内核上。 |
-| `jupyter_execute` | 在会话的内核里运行代码；返回 stdout、最后一个表达式的值、stderr、traceback，以及存下来的图片/PDF 输出路径。这次运行同时会作为一格记录进面板，并标上 `模型` 徽标。 |
-| `jupyter_notebook` | 读取面板里的笔记本（单元格、源码、输出、执行计数），并对其中一格做 `add`、`update`、`delete` 或 `run`。`ifRevision` 会拒绝一个基于模型没看过的版本的修改；`update` 会在面板里留下可复核的 diff，而不是悄悄换掉你的代码。 |
-| `jupyter_kernel` | `list`、`start`、`restart`、`interrupt`、`shutdown`，或者 `attach` 到服务器上已经存在的某个内核。 |
+| `jupyter_connect` | **添加**一个 JupyterLab 地址并验证凭据；已经连着的服务器保持连接。会归一化 `/lab`、`/tree` 和 `?token=...`；新的连接成为默认连接；报告服务器版本、kernelspec、运行中的内核和完整的连接列表。 |
+| `jupyter_status` | 每一台已连接的服务器、默认那台的版本、kernelspec 与运行中的内核，以及这段对话绑定在哪个内核上。 |
+| `jupyter_execute` | 在面板当前那一页绑定的服务器的内核里运行代码（`server` 参数可以指定别的连接）；返回 stdout、最后一个表达式的值、stderr、traceback，以及存下来的图片/PDF 输出路径。这次运行同时会作为一格记录进面板，并标上 `模型` 徽标。 |
+| `jupyter_notebook` | 读取面板里的笔记本（单元格、源码、输出、执行计数，以及它跑在哪台服务器上），并对其中一格做 `add`、`update`、`delete` 或 `run`。`ifRevision` 会拒绝一个基于模型没看过的版本的修改；`update` 会在面板里留下可复核的 diff，而不是悄悄换掉你的代码。 |
+| `jupyter_kernel` | 在你指定的服务器（缺省是面板当前页那台）上做 `list`、`start`、`restart`、`interrupt`、`shutdown`，或者 `attach` 到已经存在的某个内核。 |
 
-会话按 DeepSeek Harness 的对话分别绑定，所以两个聊天不会共享命名空间。绑定关系镜像到
-`$DSH_HOME/jupyterlab/kernels.json`，因此插件重载或应用重启之后会重新接上同一个内核，而不是
-悄悄起一个空的。
+会话按 DeepSeek Harness 的对话分别绑定，所以两个聊天不会共享命名空间；而**内核按对话、
+也按服务器绑定**：本地服务器上的一页和远端机器上的一页各有一个内核。绑定关系以
+`<服务器>::<会话>` 为键镜像到 `$DSH_HOME/jupyterlab/kernels.json`，因此插件重载或应用重启
+之后会重新接上同一批内核，而不是悄悄起一堆空的。笔记本页本身另有一份镜像，其中记着每一页
+绑定的是哪台服务器。
 
 ## 笔记本面板
 
@@ -52,8 +58,15 @@
   所以手滑按了 F5，编辑器会带着那段文字回来。它从不离开浏览器——草稿不是一条命令。草稿按笔记本
   分层保存，所以你切到别的页看一眼再回来，那段没写完的段落还在原处。
 - **一个会话里可以有好几本笔记本**：头部的选择器在它们之间切换，`+ 新建` 再开一本（最多十二本，
-  名字由宿主起）。每一页有自己的单元格、输出和导出；它们共用这个会话的内核，所以在一页上定义的
-  变量换到下一页仍然在。离开 `全部运行` 正在跑的那一页时它会停下——看不见的停止按钮等于没有。
+  名字由宿主起）。每一页有自己的单元格、输出、导出和服务器绑定；绑定在同一台服务器上的页共用
+  那台服务器的内核，所以在一页上定义的变量换到下一页仍然在。离开 `全部运行` 正在跑的那一页时
+  它会停下——看不见的停止按钮等于没有。
+- **一个会话里可以有好几台服务器**：头部最前面的服务器选择器决定当前这一页跑在哪台机器上，
+  `连接…` 打开连接列表和很短的添加表单——可选名称、地址、认证方式和凭据。选择器显示的是名称
+  （回环地址直接显示 `localhost`），地址放在 tooltip 里。每个连接都显示认证方式、`编辑`（改名称
+  或换凭据，留空保持已存的值）和 `移除`。每一页保留自己的绑定：A 页可以跑在本机，
+  B 页可以跑在远端 GPU 机器上，各有自己的内核和变量。移除一个连接只会关掉本进程到它的信道，
+  绑定它的页照旧渲染并显示 `未连接`——它绝不会背着你把笔记本挪到另一台机器上。
 - **长输出会折叠**：超过 24 行（或 4 000 字符，HTML 是 2 000）的输出默认收起，带一个 `展开`
   开关，于是一个刷屏的日志单元格不会把其余内容顶出屏幕。
 - **富输出**：一个 MIME bundle 会取面板能画的最富的那一种来渲染。`text/html`——pandas、polars
@@ -75,19 +88,25 @@
 - **可复核的改动**：当模型改写你写的某个单元格（`jupyter_notebook` 的 `update`）时，那一格会
   出现 `有改动` 标记，而不是悄悄变成另一段代码。展开它能看到被替换掉的内容的逐行 diff；`保留`
   接受它，`撤销` 用一条命令恢复你的版本。你自己的编辑是新的基线，会清掉这个标记。
-- **内核**：头部显示绑定的内核，并提供 `中断` 与 `重启内核`。
+- **内核**：头部显示这一页跑在哪台服务器上、绑定了哪个内核，并提供 `中断` 与 `重启内核`——两者
+  只作用于这一页那台服务器，所以重启远端内核不会碰到本机那个。
 - **可移植**：`导出` 把笔记本下载成 `.ipynb`（nbformat 4.5，带执行计数和输出）；`导入` 用你选的
   文件替换它。这次转换是**有损**的，并且写在文档里——raw 单元格变成 markdown，面板画不出的输出
   类型被丢弃，过大的图片和标记会回退或被删——但每一处损失都会在工具栏下方的一行里报告出来，
   而不是悄悄发生。
 
-**面板与模型共用一个内核、一本笔记本。**你在单元格里定义的变量，`jupyter_execute` 立刻能看见，
-反过来也一样，双向且立即——不存在另一个「笔记本内核」。并发由同一个按内核排的队列处理，所以
-模型在执行时你运行一格，它只是排队等一等。模型也能用 `jupyter_notebook` 读和改你写的单元格，
-这正是「修一下第 3 格」这类请求可以被执行、而不必靠猜的原因。一个会话可以容纳好几本笔记本；
-工具的每次回复都会说明面板上是哪一本，而切换页面会告诉模型：之前的单元格编号已经不指向原处了。
+**面板与模型按页、按服务器共用一个内核。**你在单元格里定义的变量，`jupyter_execute`（在那一页
+的服务器上运行时）立刻能看见，反过来也一样，双向且立即——不存在另一个「笔记本内核」。并发由
+同一个按内核排的队列处理，所以模型在执行时你运行一格，它只是排队等一等。模型也能用
+`jupyter_notebook` 读和改你写的单元格，这正是「修一下第 3 格」这类请求可以被执行、而不必靠猜的
+原因。一个会话可以容纳好几本笔记本，每本绑定一台服务器；工具的每次回复都会说明面板上是哪一本、
+跑在哪台服务器上，而切换页面会告诉模型：之前的单元格编号已经不指向原处了。换一台服务器就是换
+一个内核，所以那边定义的变量在这边不存在。
 
-单元格镜像到 `$DSH_HOME/jupyterlab/notebooks/<session>.json`，所以刷新页面或重启应用都能恢复。
+单元格镜像到 `$DSH_HOME/jupyterlab/notebooks/<session>.json`（连同每一页绑定的服务器），所以
+刷新页面或重启应用都能恢复。运行时添加的连接镜像到 `$DSH_HOME/jupyterlab/servers.json`，权限
+`0600`——这个文件里是凭据，和 profile 配置一样的明文形式。profile 配置里点名的服务器不会复制进
+这个文件：配置在每次启动时重新生效，它是这些连接的唯一来源。
 
 ### 打开它
 
@@ -107,7 +126,7 @@
 在这个目录下，于一个 DeepSeek Harness 会话中执行：
 
 ```
-plugin_manager { action: "install_bundle", target: "/Users/yanhaopeng/MyProjects/dsh-jupyterlab" }
+plugin_manager { action: "install_bundle", target: "/Users/yanhaopeng/MyProjects/dsh-jupyter" }
 ```
 
 插件包会装进当前 profile，写进 `dsh.profile.bundles`，并通过 HMR 激活。读一下结果的
@@ -121,10 +140,19 @@ Harness 应用；之后源码改动就直接从这个目录生效。
 
 ## 配置
 
-上手只需要 `url` 一个字段，其余都有默认值。
+上手只需要 `url` 一个字段，其余都有默认值。第二台服务器可以之后在面板里加，也可以提前用
+`servers:` 配好。
 
 **让模型来配。** 插件在完全没有配置的情况下也会加载。说「连到 http://aimax395.local:9002/lab，
-token 是 XYZ」，模型就会调用 `jupyter_connect`。运行时设置一直有效，直到插件重新挂载。
+token 是 XYZ」，模型就会调用 `jupyter_connect`，它加上这个连接并把它设为默认。运行时添加的连接
+记在 `$DSH_HOME/jupyterlab/servers.json`，所以插件重载、应用重启之后都还在。
+
+**或者在面板里加。** 笔记本头部的 `连接…` 打开连接列表和一个很短的表单：可选的**名称**（选择器
+里显示它，而不是一串地址）、JupyterLab 地址、认证方式——`密码`（默认）、`令牌`、`仅代理 Cookie`
+——以及凭据。没有用户名字段：Jupyter 本来就不用它，问了只会让表单更长。点 `连接` 会真的去验证
+地址和凭据；失败时表单保持打开、地址还在，服务器的答复显示在错误行里。列表按名称列出每个连接，
+带地址、认证方式和一个 `移除` 按钮。凭据只存在于宿主那一侧：面板读回来的只有名称、地址、标签和
+认证方式，从来没有 token 或密码。
 
 **或者写进 profile。** 在 `$DSH_PROFILE_DIR/cordis.patch.yml` 里给这个插件那一行加一个 `config:`
 映射，它会覆盖插件包自带的 patch：
@@ -133,9 +161,17 @@ token 是 XYZ」，模型就会调用 `jupyter_connect`。运行时设置一直�
 - id: jupyterlab
   name: '@local/dsh-jupyterlab'
   config:
+    name: 本地
     url: http://aimax395.local:9002/lab
     token: <your token>
     kernelName: python3
+    # 可选：再预置一个连接，打开面板之前就能用。`servers` 里的条目继承上面所有非凭据选项；
+    # 凭据属于它被输入时针对的那台主机，这里的 token 不会被发给另一台服务器。
+    servers:
+      - name: GPU 机器
+        url: http://gpu-box:9003/lab
+        password: <明文密码>
+        kernelName: python3
 ```
 
 ### 凭据
@@ -150,15 +186,59 @@ Jupyter 接受 token 或密码，两种都支持：
 `jupyter_server_config.json` 里的密码**哈希**（`argon2:$argon2id$...` 那个值）不是凭据：它没法
 被重放，只会被拒绝。请用明文密码，或者用 token。
 
-凭据属于它被输入时针对的那台主机。把 Harness 指向**另一个**地址会丢掉之前的 token/密码，除非
-同一次调用提供了替代值——这样「连到新服务器」永远不可能把旧服务器的秘密泄露给它。
+凭据属于它被输入时针对的那台主机。用 `jupyter_connect` 或面板加一台服务器，绝不会复用另一台
+的 token/密码，所以「连到新服务器」永远不可能把旧服务器的秘密泄露给它。
+
+凭据存放在两个地方，都是明文，都需要你自己保护好：你写的 profile YAML，以及
+`$DSH_HOME/jupyterlab/servers.json`（权限 `0600`）——后者只存运行时添加的连接。profile 里点名的
+服务器**不会**被抄进这个文件，因为配置每次启动都会重新生效，所以从配置里删掉它就是真的删掉。
+在面板里移除一台来自配置的服务器只在本次运行有效；想永久去掉就改配置。
+
+### 在 SSO / 访问代理后面
+
+有些部署会在 Jupyter 前面挡一层企业访问代理（openresty + SSO 网关、零信任网关、`oauth2-proxy`）。
+它对**所有**未认证的路径——`/lab`、`/api/status`，甚至 Jupyter 自己的 `/login`——都回 `302` 到登录页，
+所以 token 和 Jupyter 密码根本没机会被服务器看到。插件会如实报出来，而不是跟着跳转：
+
+```
+jupyter: …/api/kernels was redirected (HTTP 302 to sso.example.com) — the request never reached
+Jupyter, so this is an SSO/access proxy in front of it rather than a wrong credential.
+```
+
+过去的方法是复用浏览器自己的会话：**把 Cookie 粘进来**。
+
+1. 在浏览器里打开这个 Jupyter 地址，照常通过网关登录；
+2. DevTools → **Network** → 该主机的任一请求 → **Request Headers** → 复制完整的 `Cookie` 值
+   （通常包含 `accessproxy_session=…; apdid=…` 这类内容）；
+3. 在笔记本面板里：`连接…` → 填地址，再选认证方式：代理后面的 Jupyter 自己有凭据就选 `令牌` /
+   `密码`；如果网关就是全部认证，选 `仅代理 Cookie`。把 Cookie 粘进 **代理 Cookie（可选）** →
+   `连接`。
+
+这个 Cookie 会随每次 REST 调用和内核 WebSocket 升级一起发送；其中的 `_xsrf` 会自动变成
+POST/DELETE 的 `X-XSRFToken`——这正是「能启动内核」的关键。它可以是唯一的凭据，也可以和
+token/密码叠加使用。
+
+两个要知道的限制：
+
+- **只在内存里。** 代理会话能访问的是网关保护的所有东西，而且有自己的过期时间，所以插件不会把它
+  写进 `servers.json`。它和 token/密码一样**随连接持久化**（`0600`、原子写），所以应用重启不需要
+  再复制一遍浏览器头；网关会话过期时，下一次调用会用同样的 302/401 报错提醒你，在连接列表里点
+  `编辑` 换一个新的即可。
+- **网关可能把会话绑在浏览器上**（设备 id、指纹、User-Agent）。如果刚粘的 Cookie 仍然回 302，
+  说明它不接受这种重放：要么找平台要可直连的 Jupyter 地址/服务 token，要么让部署开一条不过
+  SSO 网关的路由。
+
+`jupyter_connect` 的 `cookie` 参数和配置里的 `servers: [{url, cookie}]` 也接受同一个值（只在宿主侧）。
 
 ### 选项
 
 | 选项 | 默认值 | 含义 |
 | --- | --- | --- |
 | `url` | — | JupyterLab 地址。`/lab`、`/tree`、结尾斜杠和 `?token=...` 都能识别。 |
+| `name` | — | 面板里显示的名称（例如 `本地`、`GPU 机器`），用来代替一长串地址；不参与连接的身份。 |
+| `servers` | — | 额外的连接：`{url, token?, password?, username?, kernelName?, workingDirectory?}` 的数组。每项继承上面的非凭据选项；除非同时给了 `url`，否则第一个配置的连接就是默认连接。 |
 | `token` / `password` / `username` | — | 凭据；`token` 优先。 |
+| `cookie` | — | 从已登录浏览器请求里复制的 `Cookie` 头，用于 Jupyter 前面的 SSO/访问代理。和连接一起存进 `servers.json`（`0600`）；会话过期时用 `编辑` 换掉。 |
 | `kernelName` | `python3` | 为新会话内核启动的 kernelspec。 |
 | `workingDirectory` | 服务器根目录 | 内核启动时所在目录（相对服务器根）。 |
 | `requestTimeoutMs` | `20000` | 一次 REST 调用的时间预算。 |
@@ -183,8 +263,9 @@ sudo scripts/alias-host.sh aimax395 192.168.5.200   # /etc/hosts: 192.168.5.200 
 ## 实现方式
 
 ```
-lib/index.js     Cordis 插件：Config schema、系统提示词、四个工具定义
-lib/runtime.js   连接与内核会话状态：一个 DSH 会话一个内核，重连，镜像到磁盘
+lib/index.js     Cordis 插件：Config schema、系统提示词、五个工具定义
+lib/connections.js  服务器连接注册表：键、凭据、describe 列表、servers.json
+lib/runtime.js   内核会话状态：一台服务器 × 一个 DSH 会话一个内核，重连，镜像到磁盘
 lib/server.js    Jupyter Server REST 客户端：URL 归一化、token/密码认证、XSRF、cookie jar
 lib/transport.js 基于 node:http/https 的 HTTP：keep-alive 套接字、缓冲响应、中止处理
 lib/dns-cache.js 进程级域名解析缓存，接入 http 与内核套接字
@@ -193,7 +274,7 @@ lib/kernel.js    在那些套接字之上的内核消息协议：执行、流式
 lib/notebook.js  面板的模型：单元格、增量输出渲染、后台运行、镜像
 lib/activity.js  用户在面板里做了什么，先缓冲，在模型下一步时交给它
 lib/assets.js    按内容寻址的图片仓库：一张图一个文件，以 immutable 提供
-lib/routes.js    面板的三条同源、需鉴权的路由（view/command、stream、assets）
+lib/routes.js    面板的四条同源、需鉴权的路由（view/command、stream、assets、download）
 lib/client.js    浏览器那一半：右侧边栏的标签页类型与笔记本 UI（无构建步骤）
 ```
 
@@ -213,6 +294,22 @@ lib/client.js    浏览器那一半：右侧边栏的标签页类型与笔记本
   发起它，而不是留给第一次工具调用；结果落进传输层要读的缓存。
 - **插件永远不会加载失败。** `url` 是可选的，REST 客户端是懒构造的，所以地址缺失或写错会表现
   为一条可读的工具错误，而不是激活失败。
+- **一个会话持有一组服务器，每一页笔记本挑其中一台。** 身份是归一化后的地址
+  （`http://host:9002`，不带 `/lab`、不带结尾斜杠），所以粘贴的 JupyterLab URL、带 `?token=`
+  的 URL、以及没有 scheme 的主机名都指向同一个连接。内核绑定在内存和磁盘上都以
+  `<服务器>::<会话>` 为键——这正是「两页跑在两台服务器上就是两个内核」、以及「一页的变量进不了
+  另一页」的原因。每一页存着这个键（`null` 表示「跟随默认」），所以重启之后笔记本仍在它原来那台
+  服务器上打开。
+- **运行时添加的连接列表是一个文件，权限 0600，原子写入。** 里面存着你在面板里或通过
+  `jupyter_connect` 添加的服务器的 token 或密码——每次重启都重输一遍不叫特性。来自 profile
+  配置的条目故意不抄进这个文件：配置每次启动都重新生效，它才是唯一来源；从配置里删掉连接，
+  它就真的从产品里消失了。
+- **被移除的连接不会变成静默回退。** 删掉一台服务器会关掉本进程到它的内核信道、清掉它的绑定，
+  但绑定它的页保留那个键：它们照常渲染、显示 `未连接`，下一次运行会以可读的「没有这个已连接
+  服务器」错误失败，而不是悄悄在另一台机器上执行。没有任何东西会背着用户把笔记本挪到别的机器。
+- **连接先验证，再保留。** `connectServer` 先加上连接、再去 probe（`/api/status`、kernelspec、
+  kernels），probe 失败就把这条连接删掉——地址打错或 token 不对，不会在选择器里留下一个只是
+  「看起来连着」的死条目。
 - **执行按内核串行。** iopub 不带请求 id，同一个内核上并发执行会把输出交错在一起。每次调用都
   排在上一次后面。
 - **取消会中断内核。** `exec.signal`（来自工具超时策略或用户）和执行预算都会发
@@ -328,6 +425,11 @@ JUPYTER_TEST_URL=http://host:9002/lab JUPYTER_TEST_PASSWORD=... node test/e2e.mj
 JUPYTER_TEST_URL='http://host:9002/lab?token=...' node test/e2e.mjs
 ```
 
+多连接的检查不需要第二台部署：`test/e2e.mjs` 用同一个真实服务器的另一个回环名字
+（`localhost` 与 `127.0.0.1`）访问它，那是另一个连接键，所以内核、绑定和 `servers.json` 都是在
+两条连接上被验证的。真的第二台服务器可以用 `JUPYTER_TEST_URL_2` 给（认证方式不同时再加
+`JUPYTER_TEST_TOKEN_2` / `JUPYTER_TEST_PASSWORD_2`）。
+
 `test/transport.mjs` 不需要 Jupyter：它在 127.0.0.1 上起自己的 HTTP 与 WebSocket 对端，数客户端
 开了几个套接字，并把各种长度档的帧往返一遍。
 
@@ -347,9 +449,10 @@ ln -s <extracted-dsh-packages>/node_modules node_modules
   `Content-Security-Policy: frame-ancestors 'self'`，所以没法嵌进 Harness 的 UI 里；面板是对
   笔记本界面的原生重实现。它支持代码与 markdown 单元格的增、改、删、插入、运行、全部运行、
   排序和类型切换——没有补全、没有变量检查器、没有调试器。
-- **可以同时开着好几本笔记本，但不能管理它们。** 一个会话最多十二本，每本有自己的单元格和导出；
-  但都不能改名、关闭或删除，换页也仍然用同一个内核——所以变量和导入会跨页带过去，没有按笔记本
-  分别绑定内核这回事。导出写的是你正在看的那一页。
+- **可以同时开着好几本笔记本，但不能管理它们。** 一个会话最多十二本，每本有自己的单元格、导出
+  和服务器绑定；但都不能改名、关闭或删除。绑定在同一台服务器上的页共用那台服务器的内核——变量
+  和导入会跨页带过去；绑定到另一台服务器的页有它自己的内核，所以单元格编号和变量不会跨过去。
+  导出写的是你正在看的那一页。
 - **`.ipynb` 的导入导出是有损的。** 读写笔记本文件能用，但面板只持有格式的一个子集：raw 单元格
   导入成 markdown，面板画不出的输出类型和超过 2 MiB 的图片会被丢掉，超过 256 KiB 的 `text/html`
   退化为纯文本，一份文档上限 500 格。每一处损失都会报告；文件与 JupyterLab 写出的不会逐字节相同。
@@ -362,12 +465,17 @@ ln -s <extracted-dsh-packages>/node_modules node_modules
 - **面板提示在下一步才到达。** 排队的提示是下一个模型请求的上下文，不是代替用户发出的消息：
   在模型空闲时编辑一个单元格，只会更新徽标，在对话继续之前什么都不发。已经在飞的请求不会被注入
   任何东西。
-- **配置没有表单。** 一个打包的 profile 如果没有手写的客户端产物，就没有 schema 驱动的设置界面，
-  所以地址和凭据来自 profile YAML 或一次 `jupyter_connect` 调用。
+- **只有连接有表单。** 面板能加、能移除服务器，但其余选项（`kernelName`、各种超时、输出预算、
+  工作目录）仍然来自 profile YAML 或插件默认值；也不能在面板里改一个已有连接的凭据——用同一个
+  地址再提交一次会在宿主侧更新它，但表单不会预填。一台服务器都没有时，内核行显示 `未连接`，
+  `连接…` 是出路。
 - **Config schema 会校验，但不会被投影。** 因为插件不 import 任何依赖，它的 `Config` 是一个手写的
   Standard Schema 而不是 schemastery 的，所以 Cordis 仍会校验并给每个选项填默认值（值不对会在
   激活时以可读消息失败），但 `Config` 的 inspect provider 报 `unsupported`，而不是渲染一份
   JSON Schema。
-- **一次只有一台服务器。** 运行时只持有一个连接；`jupyter_connect` 会切换它。
+- **远端服务器必须能被 Harness 自己所在的那台机器访问到。** 插件里没有 SSH 隧道或端口转发：
+  一个只监听另一台机器上 `127.0.0.1` 的 Jupyter，没法通过那台机器的名字连上去。把连接指向本机
+  打得开的地址（DNS 名、可路由的 IP、网关）——`.local` 或 `.internal` 名字没问题，带路径前缀的
+  反向代理也没问题。
 - **只做代码执行。** Contents API（在服务器上读写笔记本文件）还没有暴露。
 - DSH 会话结束时内核仍留着；用 `jupyter_kernel` 或在 JupyterLab 里把它们关掉。
