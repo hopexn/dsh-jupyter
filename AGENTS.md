@@ -1,7 +1,8 @@
 # AGENTS.md
 
-给在这个仓库里动手的 agent（和人）的工作约定。用户视角的用法在 `README.md`，这里只说
-"改之前要知道什么"。
+给在这个仓库里动手的 agent（和人）的工作约定。**`README.md` 只面向用户**：安装、配置、
+怎么用、有什么限制。设计理由、开发环境、验证命令都留在这里和 `docs/`——README 里不放这些，
+也不放某个人的机器路径。这里只说"改之前要知道什么"。
 
 ## 第一件事：先读设计稿，把它当索引
 
@@ -24,7 +25,7 @@
 
 | 文件 | 面向谁 | 什么时候改 |
 | --- | --- | --- |
-| `README.md` | 用户 | 安装、配置、能力、限制变了 |
+| `README.md` | 用户 | 安装、配置、能力、限制变了；**不写**设计理由、开发环境与验证命令 |
 | `docs/design.md` | 改代码的人 | **结构**变了：模块、路由、符号、预算常量、事件类型 |
 | `docs/performance-review.md` | 判断性能的人 | 有新的测量或决策；只追加，不改写历史结论 |
 | `docs/dsh-client-plugin-contract.md` | 查宿主契约的人 | 从发布包摘录的参考资料，不随本仓库演进 |
@@ -90,27 +91,61 @@ notebook/ipynb/assets/routes`）改完要**重启 DeepSeek Harness**；浏览器
 
 ## 验证
 
+五条**离线**套件：不连网、不需要 Jupyter。
+
 ```bash
-node test/transport.mjs   # 传输层，自带 peer，无需 Jupyter
+node test/transport.mjs   # 传输层，自带 peer
 node test/ipynb.mjs       # .ipynb 往返与丢失项（纯函数）
 node test/notebook.mjs    # 面板模型与四条路由
 node test/activity.mjs    # 面板活动 → 模型上下文（note 文案、交付守卫）
 node test/client.mjs      # 浏览器半边（假 React 装载，不跑真实 DOM）
 
-# 需要真服务器（起法见 README「Verifying a change」）
-node test/e2e.mjs
-node test/register.mjs    # 需要 node_modules 链接到 DSH 包
+npm run test:offline      # 上面五条一起跑
 ```
 
-`test/register.mjs` 依赖 `node_modules` 指向 DSH 的包（开发用软链，不进包清单）：
+两条**需要真服务器**。起一台一次性的，但**不要**加 `disable_check_xsrf`：它会掩盖真实的认证
+缺陷（第一轮就是这么漏掉 `X-XSRFToken` 的）。
+
+```bash
+# token 认证
+jupyter server --no-browser --port=9003 \
+  --IdentityProvider.token=dsh-test-token --ServerApp.root_dir=/tmp/jupyter-test
+
+# 密码认证：trait 是 IdentityProvider.hashed_password；
+# 裸的 `password` 选项会被静默忽略，看起来和「密码错了」一模一样。
+python -c "from jupyter_server.auth import passwd; print(passwd('dsh-test-password'))"
+jupyter server --no-browser --port=9004 \
+  --IdentityProvider.hashed_password='<上一步打印的 hash>' --ServerApp.root_dir=/tmp/jupyter-test
+```
+
+然后按认证方式跑：
+
+```bash
+JUPYTER_TEST_URL=http://127.0.0.1:9003/lab JUPYTER_TEST_TOKEN=dsh-test-token node test/e2e.mjs
+JUPYTER_TEST_URL=http://127.0.0.1:9004/lab JUPYTER_TEST_PASSWORD=dsh-test-password node test/e2e.mjs
+JUPYTER_TEST_URL=... node test/register.mjs   # 还要先链接 node_modules，见下
+```
+
+`test/register.mjs` 依赖 `node_modules` 指向 DSH 的包（开发用软链，不进包清单，也不属于安装后的
+插件）：
 
 ```bash
 ln -s <extracted-dsh-packages>/node_modules node_modules
 ```
 
 `npm test` 跑全部七套（`scripts/test-all.mjs`）：五条离线套件总会跑，`e2e` 与 `register` 只在
-`JUPYTER_TEST_URL` 存在时加入。只改渲染或面板行为时，离线五套够了；动了协议、认证、生命周期，
-必须跑 `e2e`。
+`JUPYTER_TEST_URL` 存在时加入。只改渲染或面板行为时，离线五套够了；动了协议、认证、路由注册、
+生命周期，必须跑 `e2e`（密码认证路径也要跑，它覆盖登录表单、XSRF 与 cookie）。
+
+## 开发环境与本机便利（都不是产品功能）
+
+- **两半的生效方式**见上文「仓库形态」：宿主半边重启、浏览器半边刷新。
+- **`.local` 名字每个进程要付一次慢解析。** macOS 上 mDNS 解析 `*.local` 约 5 秒；插件在挂载时
+  预热并缓存。想连这一次也省掉，可以用 `/etc/hosts` 别名：
+  `sudo scripts/alias-host.sh jupyterbox 10.0.0.10`（幂等、改前备份），然后把地址写成
+  `http://jupyterbox:9002/lab`。脚本是给 macOS 开发机的便利工具，不属于包本身。
+- **测试用的 home 目录。** `test/e2e.mjs` 与 `test/register.mjs` 会把 `DSH_HOME` 指向临时目录，
+  不会碰你正在用的 `~/.dsh`；写测试时保持这一点。
 
 ## 提交
 
