@@ -286,8 +286,14 @@ await check('it registers both dictionaries with every key the UI asks for', () 
   assert.equal(page.registered.locales[0].ns, 'jupyterlab')
   assert.deepEqual(Object.keys(page.registered.locales[0].dicts).sort(), ['en', 'zh'])
   const english = page.registered.locales[0].dicts.en
-  for (const key of ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss', 'cellLabel', 'outputLabel', 'toCode', 'toMarkdown', 'editorHint', 'changed', 'changedByAgent', 'keepChange', 'undoChange']) {
+  const chinese = page.registered.locales[0].dicts.zh
+  const keys = ['title', 'open', 'openLabel', 'addCell', 'run', 'runHint', 'remove', 'up', 'down', 'done', 'restart', 'interrupt', 'clearOutputs', 'loading', 'retry', 'noKernel', 'running', 'placeholder', 'notesTitle', 'discardNotes', 'agent', 'agentCell', 'runAll', 'runAllHint', 'stopRunAll', 'stopRunAllHint', 'exportIpynb', 'exportHint', 'importIpynb', 'importHint', 'importBad', 'insertBelow', 'showMore', 'showLess', 'dismiss', 'cellLabel', 'outputLabel', 'toCode', 'toMarkdown', 'editorHint', 'changed', 'changedByAgent', 'keepChange', 'undoChange',
+    // Several servers in one session: the picker, the connection list, and the form.
+    'serverPicker', 'serverNotConnected', 'connectServer', 'connectServerHint', 'connectionsTitle', 'noServers', 'forgetServer', 'forgetServerHint', 'serverName', 'serverNamePlaceholder', 'serverUrl', 'urlPlaceholder', 'authModeLabel', 'authToken', 'authPassword', 'authCookie', 'authNone', 'tokenPlaceholder', 'passwordPlaceholder', 'connect', 'save', 'cancel', 'close', 'nameFallback', 'editServer', 'editServerHint', 'editing', 'keepCurrent']
+  for (const key of keys) {
     assert.equal(typeof english[key], 'string', `missing translation "${key}"`)
+    // A control with no Chinese label is an English control on a Chinese page.
+    assert.equal(typeof chinese[key], 'string', `missing zh translation "${key}"`)
   }
 })
 await check('it registers a kind-only notebook tab type', () => {
@@ -1114,6 +1120,458 @@ await check('drafts survive a switch away from the page they belong to', () => {
     const saved = JSON.parse(storage.map.get('dshj:draft:s1'))
     assert.deepEqual(saved.drafts, { main: { c1: 'only in main' } }, 'the text is stored per page')
     assert.equal(saved.notebook, 'main')
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
+})
+
+console.log('\nseveral servers')
+
+/** One entry of the describe list the host sends (never a credential). */
+function serverOf(overrides = {}) {
+  const key = overrides.key ?? 'http://127.0.0.1:9002'
+  return {
+    key,
+    url: overrides.url ?? key,
+    label: overrides.label ?? key.replace(/^https?:\/\//, ''),
+    authMode: 'token',
+    hasCredentials: true,
+    default: false,
+    ...overrides,
+  }
+}
+
+/**
+ * The server fields `view()` sends once a session can hold several servers.
+ *
+ * Mirrors the host contract: `server` is the resolved key of the page, `serverUrl` is null when the
+ * key is unknown there, and `serverConnected` says whether the registry still has it.
+ */
+function serverFields(servers, options = {}) {
+  const bound = options.server === undefined ? (servers[0]?.key ?? null) : options.server
+  const known = servers.find((entry) => entry.key === bound)
+  return {
+    configured: servers.length > 0,
+    defaultServer: known?.default === true ? known.key : (servers[0]?.key ?? undefined),
+    servers,
+    server: bound,
+    serverUrl: options.serverUrl === undefined ? (known?.url ?? null) : options.serverUrl,
+    serverConnected: options.serverConnected === undefined ? known !== undefined : options.serverConnected,
+    ...options.extra,
+  }
+}
+
+/** The panel props every server test drives. */
+const panelProps = { sessionId: 's1', t: (key) => key }
+
+/** Render the panel again without discarding the hook state a click just wrote. */
+function rerender() {
+  page.React.reset()
+  return page.component('sidebar.right.pane.tab')(panelProps)
+}
+
+/** The connections panel, when it is open. */
+function connectionsOf(tree) {
+  return flatten(tree).find((node) => String(node.props?.className ?? '').includes('dshj-connections'))
+}
+
+/** The add-connection form inside the open panel. */
+function formOf(tree) {
+  return flatten(connectionsOf(tree)).find((node) => node.type === 'form')
+}
+
+/** One input (or textarea) of the connect form, by its accessible name. */
+function fieldOf(form, label) {
+  return flatten(form).find((node) => (node.type === 'input' || node.type === 'textarea')
+    && node.props?.['aria-label'] === label)
+}
+
+/** Open the connection panel by pressing the header button, the way a user does. */
+function openConnections(tree) {
+  const toggle = byText(tree, 'connectServer')
+  assert.ok(toggle !== undefined, 'the header must offer a way into the connection list')
+  toggle.props.onClick()
+  return rerender()
+}
+
+await check('the server picker lists the connections and marks the page\'s server', () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002', label: '127.0.0.1:9002', name: 'local' })
+  const remote = serverOf({ key: 'http://aimax395.local:9003', label: 'aimax395.local:9003', name: 'GPU box', authMode: 'password' })
+  const fields = serverFields([local, remote], { server: remote.key })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 110, ...fields }))
+  try {
+    const tree = primedTree(fields)
+    const picker = findAll(tree, 'select').find((node) => String(node.props.className).includes('dshj-server'))
+    assert.ok(picker !== undefined, 'the header must show which server this page runs on')
+    assert.equal(picker.props.value, remote.key, 'the open notebook is the selected server')
+    assert.deepEqual(picker.props.children.map((option) => option.props.value), [local.key, remote.key])
+    assert.deepEqual(picker.props.children.map((option) => textOf(option)), ['local', 'GPU box'],
+      'a named connection shows its name, not the address')
+    assert.equal(picker.props['aria-label'], 'serverPicker')
+    assert.equal(picker.props.title, 'serverPicker')
+    assert.notEqual(picker.props.disabled, true, 'a configured session can switch servers')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('choosing a server binds the page to it with one command', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const remote = serverOf({ key: 'http://aimax395.local:9003' })
+  const fields = serverFields([local, remote], { server: remote.key })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 111, ...fields }))
+  try {
+    const picker = findAll(primedTree(fields), 'select').find((node) => String(node.props.className).includes('dshj-server'))
+    await picker.props.onChange({ target: { value: local.key } })
+    const sent = fetchState.calls.map((call) => call.command).filter((command) => command !== null)
+    assert.equal(sent.length, 1, 'one switch, not one per render')
+    assert.deepEqual(sent[0], { action: 'bindServer', server: local.key, sessionId: 's1' })
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a loopback connection is called localhost in the picker', () => {
+  const local = serverOf({ key: 'http://127.0.0.1:8765', label: '127.0.0.1:8765' })
+  const fields = serverFields([local])
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 113, ...fields }))
+  try {
+    const picker = findAll(primedTree(fields), 'select').find((node) => String(node.props.className).includes('dshj-server'))
+    assert.deepEqual(picker.props.children.map(textOf), ['localhost'],
+      'the local machine has a name; the port is only a tooltip away')
+    assert.equal(findAll(primedTree(fields), 'select').find((node) => String(node.props.className).includes('dshj-server')).props.title, 'serverPicker')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a stored connection can be edited: identity fixed, blank credential keeps the secret', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002', name: 'local' })
+  const remote = serverOf({ key: 'https://kml.example/lab', name: 'KML', authMode: 'password' })
+  const fields = serverFields([local, remote], { server: remote.key })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 121, ...fields }))
+  try {
+    let tree = openConnections(primedTree(fields))
+    const edit = flatten(connectionsOf(tree)).find((node) => node.type === 'button'
+      && node.props?.title === 'editServerHint'
+      && String(node.props?.['aria-label']).includes('KML'))
+    assert.ok(edit !== undefined, 'each connection needs an edit control')
+    edit.props.onClick()
+    tree = rerender()
+    let form = formOf(tree)
+    assert.equal(fieldOf(form, 'serverName').props.value, 'KML')
+    assert.equal(fieldOf(form, 'serverUrl').props.value, 'https://kml.example/lab')
+    assert.equal(fieldOf(form, 'serverUrl').props.disabled, true, 'the address is the connection identity')
+    const mode = flatten(form).find((node) => node.type === 'select' && node.props?.['aria-label'] === 'authModeLabel')
+    assert.equal(mode.props.value, 'password', 'the stored auth mode is shown')
+    assert.equal(mode.props.disabled, true)
+    assert.equal(fieldOf(form, 'authPassword').props.value, '', 'the host never sends a stored secret back')
+    const submit = flatten(form).find((node) => node.type === 'button' && node.props.type === 'submit')
+    assert.equal(textOf(submit), 'save', 'saving an edit is not creating a connection')
+    assert.equal(submit.props.disabled, false, 'a blank credential means keep the stored one')
+    fieldOf(form, 'serverName').props.onChange({ target: { value: 'KML prod' } })
+    form = formOf(rerender())
+    fieldOf(form, 'proxyCookie').props.onChange({ target: { value: 'accessproxy_session=fresh' } })
+    form = formOf(rerender())
+    await form.props.onSubmit({ preventDefault() {} })
+    const posts = fetchState.calls.filter((call) => call.command?.action === 'connectServer')
+    assert.equal(posts.length, 1)
+    assert.deepEqual(posts[0].command, {
+      action: 'connectServer',
+      url: 'https://kml.example/lab',
+      name: 'KML prod',
+      cookie: 'accessproxy_session=fresh',
+      sessionId: 's1',
+    })
+    assert.equal('password' in posts[0].command, false, 'a blank field must not clear the stored password')
+    assert.equal(connectionsOf(rerender()), undefined, 'a successful edit closes the panel')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('with no server configured the picker is disabled and says so', () => {
+  const fields = serverFields([], { server: null, serverUrl: null, serverConnected: false })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 112, ...fields }))
+  try {
+    const tree = primedTree(fields)
+    const picker = findAll(tree, 'select').find((node) => String(node.props.className).includes('dshj-server'))
+    assert.equal(picker.props.disabled, true, 'nothing to choose yet')
+    assert.equal(picker.props.value, '')
+    assert.deepEqual(picker.props.children.map(textOf), ['serverNotConnected'])
+    assert.equal(textOf(byText(tree, 'connectServer')), 'connectServer', 'the way in is still offered')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a page bound to a forgotten server says so, and Run still asks the host', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const gone = 'http://old.local:9004'
+  const fields = serverFields([local], { server: gone, serverUrl: gone, serverConnected: false })
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 113, ...fields, kernel: undefined }))
+  try {
+    const tree = primedTree({ ...fields, kernel: undefined })
+    const picker = findAll(tree, 'select').find((node) => String(node.props.className).includes('dshj-server'))
+    assert.equal(picker.props.value, gone, 'the page keeps its key even though the server is gone')
+    assert.deepEqual(picker.props.children.map((option) => option.props.value), [gone, local.key],
+      'the forgotten key still has to be representable, or the picker has no valid value')
+    const row = flatten(tree).find((node) => String(node.props?.className ?? '').startsWith('dshj-kernel'))
+    assert.match(row.props.className, /dshj-server-off/, 'the kernel row carries the error styling')
+    assert.equal(row.props.role, 'status')
+    assert.match(textOf(row), /serverNotConnected/)
+    assert.match(textOf(row), /old\.local:9004/, 'and names the server it cannot reach')
+    // The host's error is the useful one: the command must still be sent.
+    const cell = findComponent(tree, (props) => props.cell?.id === 'c1')
+    await cell.props.onRun('c1', 'print(1)')
+    await tick()
+    assert.ok(fetchState.calls.some((call) => call.command?.action === 'runCell'), 'Run still posts runCell')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('the connection panel lists what is connected and forgets on request', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002', authMode: 'token' })
+  const remote = serverOf({ key: 'http://aimax395.local:9003', authMode: 'password' })
+  const fields = serverFields([local, remote])
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 114, ...fields }))
+  try {
+    const first = primedTree(fields)
+    assert.equal(connectionsOf(first), undefined, 'the panel starts closed: the header stays a header')
+    assert.equal(byText(first, 'connectServer').props['aria-expanded'], 'false')
+    const opened = openConnections(first)
+    const panel = connectionsOf(opened)
+    assert.ok(panel !== undefined, 'pressing Connect… must reveal the connection list')
+    assert.equal(panel.props.role, 'region')
+    assert.equal(panel.props['aria-label'], 'connectionsTitle')
+    assert.match(textOf(panel), /127\.0\.0\.1:9002/)
+    assert.match(textOf(panel), /aimax395\.local:9003/)
+    assert.match(textOf(panel), /authToken/, 'the auth mode is shown per connection')
+    assert.match(textOf(panel), /authPassword/)
+    const forgets = flatten(panel).filter((node) => node.type === 'button' && textOf(node) === 'forgetServer')
+    assert.equal(forgets.length, 2, 'one Forget per connection')
+    assert.equal(forgets[1].props['aria-label'], 'forgetServer: aimax395.local:9003')
+    await forgets[1].props.onClick()
+    await tick()
+    const sent = fetchState.calls.map((call) => call.command).filter((command) => command !== null)
+    assert.deepEqual(sent, [{ action: 'forgetServer', server: remote.key, sessionId: 's1' }])
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('the connect form posts a token, then closes', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 115, ...fields }))
+  try {
+    const opened = openConnections(primedTree(fields))
+    let form = formOf(opened)
+    assert.ok(form !== undefined, 'the panel must offer a form, not just a list')
+    assert.equal(flatten(form).find((node) => node.type === 'button' && node.props.type === 'submit').props.disabled, true,
+      'an empty address cannot be sent')
+    // Password is the default; a token is one mode switch away.
+    const mode = flatten(form).find((node) => node.type === 'select' && node.props?.['aria-label'] === 'authModeLabel')
+    mode.props.onChange({ target: { value: 'token' } })
+    form = formOf(rerender())
+    fieldOf(form, 'serverUrl').props.onChange({ target: { value: 'http://localhost:9003' } })
+    form = formOf(rerender())
+    fieldOf(form, 'authToken').props.onChange({ target: { value: 'sekret-token' } })
+    form = formOf(rerender())
+    await form.props.onSubmit({ preventDefault() {} })
+    const posts = fetchState.calls.filter((call) => call.command?.action === 'connectServer')
+    assert.equal(posts.length, 1)
+    assert.deepEqual(posts[0].command, {
+      action: 'connectServer',
+      url: 'http://localhost:9003',
+      token: 'sekret-token',
+      sessionId: 's1',
+    })
+    // The credential travels in the body and nowhere else.
+    assert.equal(posts[0].url, 'api/jupyterlab/notebook')
+    assert.doesNotMatch(posts[0].url, /sekret-token/)
+    assert.equal(connectionsOf(rerender()), undefined, 'a successful connection closes the panel')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('password is the default, there is no username, and a name is sent along', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 116, ...fields }))
+  try {
+    let tree = openConnections(primedTree(fields))
+    let form = formOf(tree)
+    // Password is the first mode, so the form starts ready for the common case behind a gateway.
+    assert.ok(fieldOf(form, 'authPassword') !== undefined, 'the form must default to password auth')
+    assert.equal(fieldOf(form, 'authToken'), undefined, 'a password connection shows no token field')
+    assert.equal(fieldOf(form, 'username'), undefined, 'Jupyter ignores the username: do not ask for it')
+    fieldOf(form, 'serverName').props.onChange({ target: { value: 'GPU box' } })
+    form = formOf(rerender())
+    fieldOf(form, 'serverUrl').props.onChange({ target: { value: 'http://localhost:9004' } })
+    form = formOf(rerender())
+    fieldOf(form, 'authPassword').props.onChange({ target: { value: 'pw-secret' } })
+    form = formOf(rerender())
+    await form.props.onSubmit({ preventDefault() {} })
+    const posts = fetchState.calls.filter((call) => call.command?.action === 'connectServer')
+    assert.equal(posts.length, 1)
+    assert.deepEqual(posts[0].command, {
+      action: 'connectServer',
+      url: 'http://localhost:9004',
+      name: 'GPU box',
+      password: 'pw-secret',
+      sessionId: 's1',
+    })
+    assert.equal('token' in posts[0].command, false, 'password mode must not send a token field')
+    assert.equal('username' in posts[0].command, false, 'the form has no username to send')
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a failed connection keeps the form open and shows the host\'s error', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const view = viewOf([cellOf()], { revision: 117, ...fields })
+  const calls = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const command = init.body === undefined ? null : JSON.parse(init.body)
+    calls.push({ url: String(url), command })
+    if (command?.action === 'connectServer') {
+      return { status: 200, json: async () => ({ error: 'JUPYTER_AUTH: the token was rejected' }) }
+    }
+    return { status: 200, json: async () => ({ ...view, revision: view.revision + calls.length }) }
+  }
+  try {
+    let tree = openConnections(primedTree(fields))
+    fieldOf(formOf(tree), 'serverUrl').props.onChange({ target: { value: 'http://bad.local:9005' } })
+    tree = rerender()
+    fieldOf(formOf(tree), 'authPassword').props.onChange({ target: { value: 'wrong-password' } })
+    tree = rerender()
+    await formOf(tree).props.onSubmit({ preventDefault() {} })
+    tree = rerender()
+    const panel = connectionsOf(tree)
+    assert.ok(panel !== undefined, 'a rejected connection must not close the panel')
+    const banner = flatten(tree).find((node) => String(node.props?.className ?? '').includes('dshj-err'))
+    assert.ok(banner !== undefined, 'the host error must be on screen')
+    assert.match(textOf(banner), /token was rejected/)
+    assert.equal(fieldOf(formOf(tree), 'serverUrl').props.value, 'http://bad.local:9005',
+      'the typed address survives, so fixing the token is one edit')
+    assert.equal(fieldOf(formOf(tree), 'authPassword').props.value, 'wrong-password')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+await check('a proxy cookie rides along with the token and is never stored', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const storage = installSessionStorage({})
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 118, ...fields }))
+  try {
+    let tree = openConnections(primedTree(fields))
+    fieldOf(formOf(tree), 'serverUrl').props.onChange({ target: { value: 'https://proxied.corp.example/lab' } })
+    tree = rerender()
+    fieldOf(formOf(tree), 'authPassword').props.onChange({ target: { value: 'jupyter-password' } })
+    tree = rerender()
+    // A proxied deployment needs the browser's SSO cookie *and* Jupyter's own credential.
+    fieldOf(formOf(tree), 'proxyCookie').props.onChange({
+      target: { value: 'accessproxy_session=abc123; apdid=device-1' },
+    })
+    tree = rerender()
+    await formOf(tree).props.onSubmit({ preventDefault() {} })
+    const posts = fetchState.calls.filter((call) => call.command?.action === 'connectServer')
+    assert.equal(posts.length, 1)
+    assert.deepEqual(posts[0].command, {
+      action: 'connectServer',
+      url: 'https://proxied.corp.example/lab',
+      password: 'jupyter-password',
+      cookie: 'accessproxy_session=abc123; apdid=device-1',
+      sessionId: 's1',
+    })
+    // The cookie is a credential: it travels only in the body, never in the URL or the tab store.
+    assert.doesNotMatch(posts[0].url, /accessproxy_session/)
+    const stored = [...storage.map.keys(), ...storage.map.values()].join('\n')
+    assert.doesNotMatch(stored, /accessproxy_session/, 'a proxy cookie must never reach sessionStorage')
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
+})
+
+await check('cookie-only mode asks for the cookie and nothing else', async () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 118, ...fields }))
+  try {
+    let tree = openConnections(primedTree(fields))
+    const mode = flatten(formOf(tree)).find((node) => node.type === 'select' && node.props?.['aria-label'] === 'authModeLabel')
+    mode.props.onChange({ target: { value: 'cookie' } })
+    tree = rerender()
+    let form = formOf(tree)
+    assert.equal(fieldOf(form, 'authToken'), undefined, 'cookie-only mode has no token field')
+    assert.equal(fieldOf(form, 'authPassword'), undefined, 'cookie-only mode has no password field')
+    fieldOf(form, 'serverUrl').props.onChange({ target: { value: 'https://proxied.corp.example/lab' } })
+    form = formOf(rerender())
+    const submit = flatten(form).find((node) => node.type === 'button' && node.props.type === 'submit')
+    assert.equal(submit.props.disabled, true, 'a cookie-only connection needs the cookie')
+    fieldOf(formOf(rerender()), 'proxyCookie').props.onChange({ target: { value: 'accessproxy_session=only' } })
+    form = formOf(rerender())
+    await form.props.onSubmit({ preventDefault() {} })
+    const posts = fetchState.calls.filter((call) => call.command?.action === 'connectServer')
+    assert.equal(posts.length, 1)
+    assert.deepEqual(posts[0].command, {
+      action: 'connectServer',
+      url: 'https://proxied.corp.example/lab',
+      cookie: 'accessproxy_session=only',
+      sessionId: 's1',
+    })
+  } finally {
+    fetchState.restore()
+  }
+})
+
+await check('a credential typed into the form is never written to the tab', () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const storage = installSessionStorage({})
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 118, ...fields }))
+  try {
+    const tree = openConnections(primedTree(fields))
+    fieldOf(formOf(tree), 'authPassword').props.onChange({ target: { value: 'sk-live-secret-123' } })
+    rerender()
+    const stored = [...storage.map.keys(), ...storage.map.values()].join('\n')
+    assert.doesNotMatch(stored, /sk-live-secret-123/, 'a token must never reach sessionStorage')
+    assert.equal(fetchState.calls.every((call) => call.command === null), true,
+      'typing a credential is not a command — it goes out only on submit')
+  } finally {
+    fetchState.restore()
+    storage.restore()
+  }
+})
+
+await check('closing the connection panel clears the credential field', () => {
+  const local = serverOf({ key: 'http://127.0.0.1:9002' })
+  const fields = serverFields([local])
+  const storage = installSessionStorage({})
+  const fetchState = installFetch(viewOf([cellOf()], { revision: 119, ...fields }))
+  try {
+    let tree = openConnections(primedTree(fields))
+    fieldOf(formOf(tree), 'authPassword').props.onChange({ target: { value: 'sk-live-secret-456' } })
+    tree = rerender()
+    const close = flatten(connectionsOf(tree)).find((node) => node.type === 'button' && node.props?.title === 'close')
+    assert.ok(close !== undefined, 'the panel needs a close control of its own')
+    close.props.onClick()
+    tree = rerender()
+    assert.equal(connectionsOf(tree), undefined, 'closing hides the panel')
+    const reopened = openConnections(tree)
+    assert.equal(fieldOf(formOf(reopened), 'authPassword').props.value, '',
+      'reopening must not resurrect a credential the user already dismissed')
+    assert.equal([...storage.map.values()].join('\n').includes('sk-live-secret-456'), false)
   } finally {
     fetchState.restore()
     storage.restore()

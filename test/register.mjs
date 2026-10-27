@@ -24,18 +24,49 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
 
 // Keep the test out of the developer's real `~/.dsh`: the notebook tool writes a mirror, and a
-// test run must not add cells to the notebook they are using.
-process.env.DSH_HOME ??= mkdtempSync(path.join(tmpdir(), 'dsh-jupyter-register-'))
+// test run must not add cells to the notebook they are using. `servers.json` lives under the same
+// home, so a connection added by a test must not leak into the running app either. Forced rather
+// than defaulted because the app's shell exports DSH_HOME, and inheriting it would defeat both.
+process.env.DSH_HOME = mkdtempSync(path.join(tmpdir(), 'dsh-jupyter-register-'))
 
 import * as plugin from '../lib/index.js'
+import { normalizeJupyterUrl } from '../lib/server.js'
 
 const URL_UNDER_TEST = process.env.JUPYTER_TEST_URL ?? 'http://127.0.0.1:9003/lab'
 // Only fall back to the local throwaway token when the address does not already carry one;
 // otherwise the default would override the credential under test.
 const PASSWORD = process.env.JUPYTER_TEST_PASSWORD
+const EMBEDDED_TOKEN = normalizeJupyterUrl(URL_UNDER_TEST).token
 const TOKEN = PASSWORD !== undefined
   ? undefined
   : process.env.JUPYTER_TEST_TOKEN ?? (URL_UNDER_TEST.includes('token=') ? undefined : 'dsh-test-token')
+/** The same live server through its other loopback name, for the multi-connection checks. */
+const SECOND_URL = alternateSpelling(URL_UNDER_TEST)
+
+/**
+ * The same server reached through the other loopback spelling (`127.0.0.1` vs `localhost`).
+ *
+ * @param url - Configured Jupyter address.
+ * @returns The alternate spelling, or undefined when this host has no loopback alias.
+ */
+function alternateSpelling(url) {
+  try {
+    const parsed = new URL(normalizeJupyterUrl(url).baseUrl)
+    const alternate = parsed.hostname === '127.0.0.1'
+      ? 'localhost'
+      : parsed.hostname === 'localhost' ? '127.0.0.1' : undefined
+    if (alternate === undefined) return undefined
+    parsed.hostname = alternate
+    return parsed.toString().replace(/\/+$/, '')
+  } catch {
+    return undefined
+  }
+}
+
+/** Escape a string for use inside a regular expression. */
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
 /** Minimal stand-in for the runtime's prompt service, which `ToolRuntime` injects. */
 class SystemPromptStub extends Service {
@@ -115,6 +146,32 @@ await check('the schema applies its documented defaults', () => {
   assert.equal(value.executeTimeoutMs, 180000)
   assert.equal(value.autoStartKernel, true)
   assert.equal(value.maxOutputChars, 20000)
+  assert.deepEqual(value.servers, [])
+  // A top-level proxy cookie is a string like any other credential.
+  assert.equal(validateConfig({ url: URL_UNDER_TEST, cookie: 'accessproxy_session=abc' }).value.cookie, 'accessproxy_session=abc')
+  // A name is a label, not a credential: the panel shows it instead of the address.
+  assert.equal(validateConfig({ url: URL_UNDER_TEST, name: 'local' }).value.name, 'local')
+})
+await check('the config schema accepts a servers list and reports bad entries', () => {
+  const ok = validateConfig({
+    servers: [
+      { url: URL_UNDER_TEST, token: 'config-token' },
+      { url: 'http://other.invalid:9002/lab', kernelName: 'python3', cookie: 'sso=1; apdid=d', name: 'GPU box' },
+    ],
+  })
+  assert.equal(ok.issues, undefined, JSON.stringify(ok.issues))
+  assert.equal(ok.value.servers.length, 2)
+  assert.equal(ok.value.servers[0].token, 'config-token')
+  assert.equal(ok.value.servers[1].kernelName, 'python3')
+  assert.equal(ok.value.servers[1].cookie, 'sso=1; apdid=d')
+  assert.equal(ok.value.servers[1].name, 'GPU box')
+  const notAnArray = validateConfig({ servers: 'nope' })
+  assert.equal(notAnArray.issues.length, 1)
+  assert.match(notAnArray.issues[0].message, /must be an array/)
+  const missingUrl = validateConfig({ servers: [{ token: 'x' }] })
+  assert.match(missingUrl.issues.map((issue) => issue.message).join(' '), /servers\[0\]\.url/)
+  const wrongType = validateConfig({ servers: [{ url: 7 }] })
+  assert.match(wrongType.issues.map((issue) => issue.message).join(' '), /servers\[0\]\.url/)
 })
 await check('an empty config is accepted, so the plugin loads unconfigured', () => {
   const { value, issues } = validateConfig({})
@@ -174,6 +231,23 @@ await check('the kernel tool constrains its action to the supported set', () => 
   const schema = ctx.tools.schemas().find((entry) => entry.name === 'jupyter_kernel')
   assert.deepEqual(schema.parameters.properties.action.enum, ['list', 'start', 'restart', 'interrupt', 'shutdown', 'attach'])
 })
+await check('the connect tool exposes the name and proxy-cookie parameters', () => {
+  const schema = ctx.tools.schemas().find((entry) => entry.name === 'jupyter_connect')
+  assert.notEqual(schema, undefined, 'jupyter_connect missing from the model-facing schema list')
+  assert.equal(schema.parameters.properties.cookie.type, 'string', 'jupyter_connect.cookie is not documented')
+  assert.ok(!(schema.parameters.required ?? []).includes('cookie'), 'jupyter_connect.cookie must be optional')
+  assert.equal(schema.parameters.properties.name.type, 'string', 'jupyter_connect.name is not documented')
+  assert.ok(!(schema.parameters.required ?? []).includes('name'), 'jupyter_connect.name must be optional')
+})
+await check('the execute and kernel tools expose an optional server argument', () => {
+  const schemas = ctx.tools.schemas()
+  for (const name of ['jupyter_execute', 'jupyter_kernel']) {
+    const schema = schemas.find((entry) => entry.name === name)
+    assert.notEqual(schema, undefined, `${name} missing from the model-facing schema list`)
+    assert.equal(schema.parameters.properties.server.type, 'string', `${name}.server is not documented`)
+    assert.ok(!(schema.parameters.required ?? []).includes('server'), `${name}.server must be optional`)
+  }
+})
 await check('the notebook tool publishes its five actions', () => {
   const schema = ctx.tools.schemas().find((entry) => entry.name === 'jupyter_notebook')
   assert.deepEqual(schema.parameters.properties.action.enum, ['read', 'add', 'update', 'delete', 'run'])
@@ -225,6 +299,9 @@ await check('jupyter_notebook starts empty and adds a cell', async () => {
   const read = await callTool(ctx, 'jupyter_notebook', { action: 'read', count: 100 })
   assert.ok(textOf(read).includes(`· ${id} · agent ---`), textOf(read))
   assert.match(textOf(read), /print\("from the notebook"\)/)
+  // The reply names the server the page runs on: with several connections a session can hold, the
+  // kernel behind these cell numbers is not obvious unless the tool says so.
+  assert.match(textOf(read), /^server: http/m, textOf(read))
 })
 await check('jupyter_notebook runs, updates and deletes that cell', async () => {
   const added = await callTool(ctx, 'jupyter_notebook', { action: 'add', source: 'print("from the notebook")' })
@@ -273,6 +350,36 @@ await check('jupyter_connect verifies an address given at runtime', async () => 
   assert.notEqual(result.isError, true, textOf(result))
   assert.match(textOf(result), /connected to http/)
   assert.match(textOf(result), /kernelspecs: .*python3/)
+})
+await check('a second connection is added without dropping the first', async () => {
+  if (SECOND_URL === undefined) {
+    console.log('      (no second loopback spelling for this host — skipped)')
+    return
+  }
+  const args = { url: SECOND_URL }
+  if (TOKEN !== undefined || EMBEDDED_TOKEN !== undefined) args.token = TOKEN ?? EMBEDDED_TOKEN
+  if (PASSWORD !== undefined) args.password = PASSWORD
+  const connected = await callTool(ctx, 'jupyter_connect', args, 'connect-second')
+  assert.notEqual(connected.isError, true, textOf(connected))
+  const connectText = textOf(connected)
+  assert.match(connectText, /connected servers:/)
+  assert.match(connectText, /2 server\(s\) connected/)
+  if (TOKEN !== undefined) assert.ok(!connectText.includes(TOKEN), 'the token leaked into tool output')
+  if (PASSWORD !== undefined) assert.ok(!connectText.includes(PASSWORD), 'the password leaked into tool output')
+
+  const secondKey = normalizeJupyterUrl(SECOND_URL).baseUrl
+  // The new connection is the default now, so a call without `server` runs on it.
+  const ran = await callTool(ctx, 'jupyter_execute', { code: 'print("on the second connection")' }, 'exec-second')
+  assert.notEqual(ran.isError, true, textOf(ran))
+  assert.match(textOf(ran), new RegExp(`server: ${escapeRegExp(secondKey)}`))
+  const explicit = await callTool(ctx, 'jupyter_execute', { code: 'print("on the first connection")', server: URL_UNDER_TEST }, 'exec-first')
+  assert.notEqual(explicit.isError, true, textOf(explicit))
+  assert.match(textOf(explicit), /server: http/)
+  const status = await callTool(ctx, 'jupyter_status', {})
+  assert.match(textOf(status), /2 server\(s\) connected/)
+  // Clean up the kernels this check started; the connections themselves are harmless in a temp home.
+  await callTool(ctx, 'jupyter_kernel', { action: 'shutdown', server: secondKey }, 'shutdown-second')
+  await callTool(ctx, 'jupyter_kernel', { action: 'shutdown', server: URL_UNDER_TEST }, 'shutdown-first')
 })
 await check('a bad token surfaces as a readable authentication failure', async () => {
   const bad = new Context()

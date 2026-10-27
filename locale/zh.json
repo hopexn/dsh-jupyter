@@ -1,4 +1,4 @@
 {
   "title": "JupyterLab",
-  "description": "连接 Jupyter 服务器，在远端持久 kernel 中执行代码。"
+  "description": "连接一台或多台 Jupyter 服务器，在远端持久内核中执行代码。"
 }

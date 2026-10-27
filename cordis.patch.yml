@@ -4,16 +4,22 @@
 # settings namespace and must stay unique across the profile.
 #
 # Configure the plugin either here (a `config:` mapping on this row, which the profile's own
-# cordis.patch.yml can override) or at runtime by asking the agent to call jupyter_connect with
-# the JupyterLab address. Example of a pre-filled config:
+# cordis.patch.yml can override), in the notebook panel's connection form, or at runtime by asking
+# the agent to call jupyter_connect with the JupyterLab address. Example of a pre-filled config,
+# with a second server kept ready next to the default one:
 #
 #   - insert:
 #       - id: jupyterlab
 #         name: '@local/dsh-jupyterlab'
 #         config:
+#           name: local
 #           url: http://aimax395.local:9002/lab
 #           token: <your token>
 #           kernelName: python3
+#           servers:
+#             - name: GPU box
+#               url: http://gpu-box:9003/lab
+#               password: <plaintext password>
 #
 - insert:
     - id: jupyterlab

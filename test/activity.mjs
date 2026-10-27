@@ -242,6 +242,132 @@ await check('the buffer keeps the newest notes', async () => {
   assert.equal(notes[7].summary, 'Edited cell 12 (code)')
 })
 
+console.log('\nseveral servers')
+
+const localServer = 'http://127.0.0.1:9002'
+const remoteServer = 'http://aimax395.local:9003'
+
+await check('a new connection is one note, and it never quotes the credential', async () => {
+  const [note] = notesOf([{ type: 'connectServer', url: remoteServer, authMode: 'token', token: 'sekret-token' }])
+  assert.equal(note.key, 'server')
+  assert.equal(note.summary, `Connected to ${remoteServer} (token auth)`)
+  assert.match(note.text, /connected the panel to the Jupyter server at http:\/\/aimax395\.local:9003/)
+  assert.match(note.text, /token auth/)
+  // The activity event carries no credential by design; this is the second line of defence.
+  assert.doesNotMatch(note.text, /sekret-token/)
+  assert.match(note.text, /stay connected/, 'connecting B must not read as disconnecting A')
+  const [password] = notesOf([{ type: 'connectServer', url: remoteServer, authMode: 'password' }])
+  assert.match(password.summary, /\(password auth\)$/)
+  const [none] = notesOf([{ type: 'connectServer', url: localServer, authMode: 'none' }])
+  assert.match(none.summary, /\(no authentication\)$/)
+})
+
+await check('rebinding the page says the kernel and its variables are not shared', async () => {
+  const [note] = notesOf([{ type: 'bindServer', url: remoteServer }])
+  assert.equal(note.key, 'server')
+  assert.equal(note.summary, `Switched this notebook to ${remoteServer}`)
+  assert.match(note.text, /bound the notebook on screen to the Jupyter server at http:\/\/aimax395\.local:9003/)
+  assert.match(note.text, /different server means a different kernel/)
+  assert.match(note.text, /variables, imports and open files .* are not shared/)
+})
+
+await check('a forgotten connection says its pages are not connected any more', async () => {
+  const [note] = notesOf([{ type: 'forgetServer', url: localServer }])
+  assert.equal(note.key, 'server')
+  assert.equal(note.summary, `Disconnected from ${localServer}`)
+  assert.match(note.text, /disconnected the panel from the Jupyter server at http:\/\/127\.0\.0\.1:9002/)
+  assert.match(note.text, /no longer reachable/)
+  assert.match(note.text, /not connected/)
+})
+
+await check('server notes use the name the user gave, keeping the address for precision', async () => {
+  const [connected] = notesOf([{ type: 'connectServer', url: remoteServer, name: 'GPU box', authMode: 'password' }])
+  assert.equal(connected.summary, 'Connected to GPU box (password auth)')
+  assert.match(connected.text, /“GPU box” at http:\/\/aimax395\.local:9003/)
+  const [bound] = notesOf([{ type: 'bindServer', url: remoteServer, name: 'GPU box' }])
+  assert.equal(bound.summary, 'Switched this notebook to GPU box')
+  assert.match(bound.text, /different server means a different kernel/)
+  const [forgotten] = notesOf([{ type: 'forgetServer', url: remoteServer, name: 'GPU box' }])
+  assert.equal(forgotten.summary, 'Disconnected from GPU box')
+  assert.match(forgotten.text, /“GPU box” at http:\/\/aimax395\.local:9003/)
+})
+
+await check('the three server notes collapse into one, newest wins', async () => {
+  const notes = notesOf([
+    { type: 'connectServer', url: localServer, authMode: 'token' },
+    { type: 'bindServer', url: remoteServer },
+    { type: 'forgetServer', url: localServer },
+  ])
+  assert.equal(notes.length, 1, 'the connection list is one piece of state, so one note')
+  assert.equal(notes[0].key, 'server')
+  assert.equal(notes[0].summary, `Disconnected from ${localServer}`)
+})
+
+await check('a page switch mentions the server only when it changed', async () => {
+  // Same server as the page that was open: the kernel is the same one, so saying anything is noise.
+  const activity = new NotebookActivity()
+  activity.record('session-a', { type: 'bindServer', url: localServer })
+  activity.record('session-a', { type: 'switchNotebook', name: 'Untitled', count: 2, server: localServer })
+  const [same] = activity.drain('session-a').filter((note) => note.key === 'notebook-switch')
+  assert.ok(same !== undefined, 'the switch note itself is always sent')
+  assert.doesNotMatch(same.text, /bound to the Jupyter server/)
+
+  // A different server means a different kernel; the note has to say so, and name both sides.
+  const [changed] = notesOf([
+    { type: 'bindServer', url: localServer },
+    { type: 'switchNotebook', name: 'Untitled', count: 2, server: remoteServer },
+  ]).filter((note) => note.key === 'notebook-switch')
+  assert.match(changed.text, /bound to the Jupyter server at http:\/\/aimax395\.local:9003/)
+  assert.match(changed.text, /http:\/\/127\.0\.0\.1:9002, a different server/)
+  assert.match(changed.text, /different kernel/)
+  assert.match(changed.text, /variables and imports are not available here/)
+})
+
+await check('the host\'s own previousServer field is what a switch compares against', async () => {
+  // The notebook model knows exactly which page it left, so it names both sides. That beats the
+  // buffer's memory, and it is the shape the real host emits.
+  const [changed] = notesOf([{
+    type: 'switchNotebook',
+    name: 'Untitled',
+    count: 2,
+    server: remoteServer,
+    previousServer: localServer,
+  }])
+  assert.match(changed.text, new RegExp(`bound to the Jupyter server at ${remoteServer.replace(/\./g, '\\.')}`))
+  assert.match(changed.text, new RegExp(`${localServer.replace(/\./g, '\\.')}, a different server`))
+
+  const [same] = notesOf([{
+    type: 'switchNotebook',
+    name: 'Untitled',
+    count: 2,
+    server: localServer,
+    previousServer: localServer,
+  }])
+  assert.doesNotMatch(same.text, /bound to the Jupyter server/)
+})
+
+await check('a new notebook names its server when it is not the previous page\'s', async () => {
+  const [note] = notesOf([
+    { type: 'bindServer', url: localServer },
+    { type: 'newNotebook', name: 'Untitled 2', server: remoteServer },
+  ]).filter((entry) => entry.key === 'notebook-new')
+  assert.ok(note !== undefined)
+  assert.match(note.text, /bound to the Jupyter server at http:\/\/aimax395\.local:9003/)
+  assert.match(note.text, /different kernel/)
+})
+
+await check('the last page\'s server survives delivery, so the next switch compares against it', async () => {
+  const activity = new NotebookActivity()
+  activity.record('session-a', { type: 'bindServer', url: localServer })
+  assert.equal(activity.drain('session-a').length, 1, 'the note was handed over')
+  // Delivering notes must not erase where the panel points; otherwise this switch could not tell
+  // that it is crossing a server boundary.
+  activity.record('session-a', { type: 'switchNotebook', name: 'Untitled', count: 1, server: remoteServer })
+  const [note] = activity.drain('session-a')
+  assert.match(note.text, /a different server/)
+  assert.match(note.text, /http:\/\/127\.0\.0\.1:9002/)
+})
+
 console.log('\nmessage')
 
 await check('the message is attributed to the plugin, not to the user', async () => {
@@ -249,9 +375,10 @@ await check('the message is attributed to the plugin, not to the user', async ()
   assert.equal(message.role, 'user')
   assert.equal(typeof message.id, 'string')
   assert.ok(message.id.length >= 16)
+  // Format v4 admits any nonempty producer-owned kind and refuses `'plugin'`; a plugin's kind is
+  // its own name. The `form: 'notice'` is what makes the transcript read it as context.
   assert.deepEqual(message.source, {
-    kind: 'plugin',
-    plugin: 'jupyterlab',
+    kind: 'jupyterlab',
     form: 'notice',
     summary: 'Edited cell 2 (code)',
   })
@@ -330,7 +457,7 @@ await check('a pending note rides with the next step, once', async () => {
   activity.record('session-a', edit)
   const first = await step(handler)
   assert.equal(first.messages.length, 2)
-  assert.equal(first.messages[1].source.plugin, 'jupyterlab')
+  assert.equal(first.messages[1].source.kind, 'jupyterlab', 'a producer-owned kind, never "plugin"')
   assert.equal(activity.pending('session-a'), 0)
 
   const second = await step(handler)
@@ -398,7 +525,7 @@ await check('a decision without a messages array still gets the note', async () 
   activity.record('session-a', edit)
   const result = await step(handlerFor('agent/pre-step'), { decision: { kind: 'enter' } })
   assert.equal(result.messages.length, 1)
-  assert.equal(result.messages[0].source.plugin, 'jupyterlab')
+  assert.equal(result.messages[0].source.kind, 'jupyterlab', 'a producer-owned kind, never "plugin"')
 })
 
 await check('the first note carries a map of the notebook, and later ones do not', async () => {

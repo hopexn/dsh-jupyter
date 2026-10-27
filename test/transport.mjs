@@ -24,6 +24,7 @@ import http from 'node:http'
 import { clearDnsCache, createLookup, dnsCacheEntries, resolveHost } from '../lib/dns-cache.js'
 import { httpRequest } from '../lib/transport.js'
 import { KernelSocket } from '../lib/websocket.js'
+import { JupyterError, JupyterServerClient } from '../lib/server.js'
 
 let passed = 0
 const failures = []
@@ -367,6 +368,155 @@ await check('send on a closed socket throws instead of silently dropping', async
     assert.throws(() => socket.send('x'), /not open/)
   } finally {
     server.close()
+  }
+})
+
+console.log('\nproxy cookie (SSO / access proxy)')
+
+/**
+ * A stand-in for a deployment behind an access proxy.
+ *
+ * It records every request's headers, answers `/api/status` like Jupyter would, rotates its
+ * session cookie on `/api/rotating`, and answers `/api/redirect` the way such a gateway does:
+ * a 302 to its SSO page, plus a *fresh anonymous* cookie that must not replace the pasted one.
+ */
+async function startProxyPeer() {
+  const seen = []
+  const server = http.createServer((request, response) => {
+    seen.push({ method: request.method, url: request.url, headers: request.headers })
+    if (request.url === '/api/redirect') {
+      response.writeHead(302, {
+        location: 'https://sso.corp.example/cas/login?service=https%3A%2F%2Fjupyter.example%2Fapi%2Fstatus',
+        'set-cookie': 'accessproxy_session=anonymous; Path=/',
+        'content-type': 'text/html',
+      })
+      response.end('<html><head><title>302 Found</title></head><body>AccessProxy</body></html>')
+      return
+    }
+    if (request.url === '/api/rotating') {
+      response.writeHead(200, {
+        'content-type': 'application/json',
+        'set-cookie': 'accessproxy_session=rotated; Path=/',
+      })
+      response.end('{}')
+      return
+    }
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(request.method === 'POST' ? '{"id":"kernel-1"}' : '{"ok":true}')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return { server, url: `http://127.0.0.1:${server.address().port}`, seen }
+}
+
+await check('a pasted cookie is sent on reads and on mutating requests', async () => {
+  const peer = await startProxyPeer()
+  try {
+    const client = new JupyterServerClient({ url: peer.url, cookie: 'accessproxy_session=abc; apdid=dev-1' })
+    assert.equal(client.authMode, 'cookie', 'a cookie-only connection has its own auth mode')
+    await client.json('/api/status')
+    await client.json('/api/kernels', { method: 'POST', json: { name: 'python3' } })
+    assert.equal(peer.seen[0].headers.cookie, 'accessproxy_session=abc; apdid=dev-1')
+    assert.equal(peer.seen[1].headers.cookie, 'accessproxy_session=abc; apdid=dev-1')
+    // No token means no Authorization header; the proxy is the credential.
+    assert.equal('authorization' in peer.seen[0].headers, false)
+  } finally {
+    peer.server.close()
+  }
+})
+
+await check('a `_xsrf` inside the pasted cookie becomes the XSRF header', async () => {
+  const peer = await startProxyPeer()
+  try {
+    const client = new JupyterServerClient({ url: peer.url, cookie: 'sso=1; _xsrf=xsrf-from-browser' })
+    await client.json('/api/kernels', { method: 'POST', json: {} })
+    assert.equal(peer.seen[0].headers['x-xsrftoken'], 'xsrf-from-browser')
+    // A read does not need it, and Jupyter ignores an extra one anyway — but the *mutating* path
+    // is the one that used to fail with 403, so it is the one asserted.
+    await client.json('/api/status')
+    assert.equal(peer.seen[1].headers['x-xsrftoken'], undefined)
+  } finally {
+    peer.server.close()
+  }
+})
+
+await check('a rotated session cookie replaces the pasted one', async () => {
+  const peer = await startProxyPeer()
+  try {
+    const client = new JupyterServerClient({ url: peer.url, cookie: 'accessproxy_session=old' })
+    await client.json('/api/rotating')
+    await client.json('/api/status')
+    assert.equal(peer.seen[1].headers.cookie, 'accessproxy_session=rotated')
+  } finally {
+    peer.server.close()
+  }
+})
+
+await check('a redirect is reported as a proxy problem, not as an HTML page', async () => {
+  const peer = await startProxyPeer()
+  try {
+    const client = new JupyterServerClient({ url: peer.url, cookie: 'accessproxy_session=abc' })
+    // The peer redirects on `/api/redirect`, like a gateway does for every unauthenticated path.
+    let error
+    try {
+      await client.json('/api/redirect')
+    } catch (cause) {
+      error = cause
+    }
+    assert.ok(error instanceof JupyterError, 'a redirect must surface as a JupyterError')
+    assert.match(error.message, /redirected \(HTTP 302 to sso\.corp\.example\)/)
+    assert.match(error.message, /SSO|access proxy/)
+    assert.match(error.message, /Cookie header/)
+    assert.doesNotMatch(error.message, /<html>/, 'the login page HTML must not be the error')
+    // The anonymous cookie the redirect carried must not clobber the pasted session.
+    await client.json('/api/status')
+    const last = peer.seen[peer.seen.length - 1]
+    assert.equal(last.headers.cookie, 'accessproxy_session=abc')
+  } finally {
+    peer.server.close()
+  }
+})
+
+/** Accept one WebSocket upgrade and record the headers it arrived with. */
+async function startUpgradeRecorder() {
+  const handshakes = []
+  const server = http.createServer((request, response) => {
+    response.writeHead(400)
+    response.end('upgrade only')
+  })
+  server.on('upgrade', (request, socket) => {
+    handshakes.push(request.headers)
+    const accept = createHash('sha1')
+      .update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64')
+    socket.write([
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${accept}`,
+      '', '',
+    ].join('\r\n'))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return { server, handshakes, url: `http://127.0.0.1:${server.address().port}` }
+}
+
+await check('the kernel WebSocket upgrade carries the proxy cookie too', async () => {
+  const recorder = await startUpgradeRecorder()
+  try {
+    const client = new JupyterServerClient({ url: recorder.url, cookie: 'accessproxy_session=abc' })
+    const target = client.wsTarget('/api/kernels/k1/channels')
+    assert.equal(target.headers.cookie, 'accessproxy_session=abc')
+    const socket = new KernelSocket(target.url, {
+      headers: target.headers,
+      lookup: createLookup(),
+      connectTimeoutMs: 3000,
+    })
+    await opened(socket)
+    socket.close()
+    assert.equal(recorder.handshakes.length, 1)
+    assert.equal(recorder.handshakes[0].cookie, 'accessproxy_session=abc')
+  } finally {
+    recorder.server.close()
   }
 })
 

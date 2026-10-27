@@ -1,4 +1,4 @@
 {
   "title": "JupyterLab",
-  "description": "Connect to a Jupyter server and run code in persistent remote kernels."
+  "description": "Connect to Jupyter servers and run code in persistent remote kernels."
 }

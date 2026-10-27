@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "JupyterLab/Jupyter Server connector: run code in persistent remote kernels from DeepSeek Harness",
+  "description": "JupyterLab/Jupyter Server connector: several servers, persistent remote kernels, notebook panel",
   "license": "MIT",
   "main": "lib/index.js",
   "scripts": {
@@ -25,7 +25,7 @@
   ],
   "meta": {
     "title": "JupyterLab",
-    "description": "Connect to a Jupyter server, run code in persistent remote kernels, and edit a notebook in the right sidebar."
+    "description": "Connect to one or more Jupyter servers, run code in persistent remote kernels, and edit a notebook in the right sidebar."
   },
   "dsh": {
     "bundle": {

@@ -35,9 +35,13 @@ async function check(label, body) {
 const directory = mkdtempSync(path.join(tmpdir(), 'dsh-notebook-test-'))
 const SESSION = 'session-under-test'
 
-/** Deterministic stand-in for the kernel, recording what it was asked to run. */
+/** Deterministic stand-in for the kernel, recording what it was asked to run and where. */
 function fakeRuntime() {
   const calls = []
+  /** `{sessionId, code, server}` per execution: which page ran on which connection. */
+  const runs = []
+  /** `{sessionId, server}` per kernel-status read: the header must describe the page's kernel. */
+  const kernelQueries = []
   let kernel = { id: 'kernel-1', name: 'python3', state: 'idle' }
   let next = 1
   const reply = (code, options = {}) => {
@@ -106,9 +110,18 @@ function fakeRuntime() {
   }
   return {
     calls,
+    runs,
+    kernelQueries,
     runtime: {
-      execute: async (_sessionId, code, options) => { calls.push(code); return reply(code, options) },
-      kernelInfo: async () => kernel,
+      execute: async (sessionId, code, options) => {
+        calls.push(code)
+        runs.push({ sessionId, code, server: options?.server })
+        return reply(code, options)
+      },
+      kernelInfo: async (sessionId, options) => {
+        kernelQueries.push({ sessionId, server: options?.server })
+        return kernel
+      },
     },
     setKernel: (value) => { kernel = value },
   }
@@ -995,6 +1008,564 @@ await check('the model names the notebook it is looking at', async () => {
   }
 })
 
+console.log('\nseveral servers in one session')
+
+/** The identity rule from the contract: a server key is the normalised base URL. */
+function fakeKey(url) {
+  let value = String(url ?? '').trim()
+  if (!/^https?:\/\//i.test(value)) value = `http://${value}`
+  return value.replace(/\/(?:lab|tree|notebooks)(?:\/.*)?$/i, '').replace(/\/+$/, '')
+}
+
+/**
+ * In-memory stand-in for the host's connection registry, with the same seam the plugin wires: a
+ * synchronous describe, an async add-and-probe, an async forget.
+ *
+ * The entries deliberately keep `token` / `password` on them, so a credential that leaked into a
+ * view, an event or a note would be caught here rather than assumed away.
+ */
+function fakeConnections(initial = []) {
+  const servers = []
+  const probes = []
+  const state = { failProbe: false, default: undefined }
+  const entryFor = (patch) => {
+    const key = fakeKey(patch.url)
+    const authMode = typeof patch.token === 'string' && patch.token.length > 0
+      ? 'token'
+      : typeof patch.password === 'string' && patch.password.length > 0
+        ? 'password'
+        : (typeof patch.cookie === 'string' && patch.cookie.length > 0 ? 'cookie' : 'none')
+    return {
+      key,
+      url: key,
+      name: patch.name,
+      label: key.replace(/^https?:\/\//, ''),
+      authMode,
+      hasCredentials: authMode !== 'none',
+      token: patch.token,
+      password: patch.password,
+      // Deliberately kept here to prove the view projection drops it.
+      cookie: patch.cookie,
+    }
+  }
+  for (const patch of initial) servers.push(entryFor(patch))
+  // The first loaded connection is the default, the way the host's registry treats `config.url`.
+  state.default = servers[0]?.key
+  const defaultKey = () => state.default ?? servers[0]?.key
+  return {
+    state,
+    probes,
+    servers: () => ({
+      configured: servers.length > 0,
+      default: defaultKey(),
+      servers: servers.map(({ key, url, name, label, authMode, hasCredentials }) => ({
+        key,
+        url,
+        ...(typeof name === 'string' && name.length > 0 ? { name } : {}),
+        label,
+        authMode,
+        hasCredentials,
+        default: key === defaultKey(),
+      })),
+    }),
+    connectServer: async (patch) => {
+      if (state.failProbe) throw new Error('jupyter authentication failed (401): the token was rejected')
+      probes.push(patch)
+      const fresh = entryFor(patch)
+      const existing = servers.findIndex((server) => server.key === fresh.key)
+      if (existing === -1) servers.push(fresh)
+      else servers[existing] = fresh
+      if (state.default === undefined) state.default = fresh.key
+      return { key: fresh.key, url: fresh.url, authMode: fresh.authMode, version: '2.14.0', kernelspecs: ['python3', 'ir'] }
+    },
+    forgetServer: async (server) => {
+      const key = fakeKey(server)
+      const index = servers.findIndex((item) => item.key === key)
+      if (index === -1) return { key, url: key, removed: false }
+      const [removed] = servers.splice(index, 1)
+      if (state.default === removed.key) state.default = servers[0]?.key
+      return { key: removed.key, url: removed.url, removed: true }
+    },
+  }
+}
+
+/** A model wired to a fake registry and to {@link fakeRuntime}. */
+function connectedModel(connections, overrides = {}) {
+  return new Notebooks({
+    directory,
+    execute: fake.runtime.execute,
+    kernelInfo: fake.runtime.kernelInfo,
+    servers: connections.servers,
+    connectServer: connections.connectServer,
+    forgetServer: connections.forgetServer,
+    ...overrides,
+  })
+}
+
+/** A note recorder: this file tests which events the model reports, not how they are worded. */
+function noteRecorder() {
+  const notes = []
+  return {
+    notes,
+    activity: {
+      record: (sessionId, event) => notes.push({ sessionId, event }),
+      pending: (sessionId) => notes.filter((entry) => entry.sessionId === sessionId).length,
+      list: () => [],
+      forget: () => {},
+    },
+  }
+}
+
+const LOCAL = { url: 'http://local.test:9003', token: 'local-secret' }
+const REMOTE = { url: 'http://remote.test:9002', password: 'remote-secret' }
+
+await check('the view names the page server, the default and every connection', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const model = connectedModel(connections)
+  try {
+    const view = await model.view('multi-fields')
+    assert.equal(view.server, 'http://local.test:9003', 'a fresh page follows the default connection')
+    assert.equal(view.serverUrl, 'http://local.test:9003')
+    assert.equal(view.serverConnected, true)
+    assert.equal(view.defaultServer, 'http://local.test:9003')
+    assert.equal(view.configured, true)
+    assert.deepEqual(view.servers.map((entry) => entry.key), ['http://local.test:9003', 'http://remote.test:9002'])
+    const remote = view.servers[1]
+    assert.equal(remote.label, 'remote.test:9002', 'the label drops the scheme')
+    assert.equal(remote.authMode, 'password')
+    assert.equal(remote.hasCredentials, true)
+    assert.equal(remote.default, false)
+    // The registry entry carries the credentials; the view is the browser's.
+    assert.equal(JSON.stringify(view).includes('local-secret'), false)
+    assert.equal(JSON.stringify(view).includes('remote-secret'), false)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('without any connection the page still renders and names no server', async () => {
+  const model = new Notebooks({ directory, execute: fake.runtime.execute, kernelInfo: async () => undefined })
+  try {
+    const view = await model.view('multi-none')
+    assert.equal(view.server, null)
+    assert.equal(view.serverUrl, null)
+    assert.equal(view.serverConnected, false)
+    assert.equal(view.defaultServer, null)
+    assert.equal(view.configured, false)
+    assert.deepEqual(view.servers, [])
+    assert.ok(view.cells.length > 0, 'not being connected is not a reason to hide the notebook')
+    assert.equal(model.snapshot('multi-none').server, null)
+    assert.equal(model.activeServer('multi-none'), undefined)
+    assert.doesNotMatch(model.outline('multi-none'), /running on/)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('each page runs its code on the server it is bound to', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const model = connectedModel(connections)
+  const session = 'multi-run'
+  try {
+    const main = await model.view(session)
+    await model.command(session, { action: 'updateCell', id: main.cells[0].id, source: 'a = 1' })
+    await model.command(session, { action: 'runCell', id: main.cells[0].id })
+    await model.idle(session)
+    const second = await model.command(session, { action: 'newNotebook', server: REMOTE.url })
+    assert.equal(second.server, 'http://remote.test:9002', 'a page opened on a server is bound to it')
+    await model.command(session, { action: 'updateCell', id: second.cells[0].id, source: 'b = 2' })
+    await model.command(session, { action: 'runCell', id: second.cells[0].id })
+    await model.idle(session)
+    const runs = fake.runs.filter((run) => run.sessionId === session)
+    assert.deepEqual(
+      runs.map((run) => run.server),
+      ['http://local.test:9003', 'http://remote.test:9002'],
+      'code must run on the page\'s server, not on whatever the default is',
+    )
+    // The header's kernel status is asked from the same server, or it would describe another host.
+    const asked = fake.kernelQueries.filter((query) => query.sessionId === session).map((query) => query.server)
+    assert.ok(asked.includes('http://local.test:9003'))
+    assert.ok(asked.includes('http://remote.test:9002'))
+    // Switching back leaves the first page on its own server.
+    const back = await model.command(session, { action: 'switchNotebook', notebook: 'main' })
+    assert.equal(back.server, 'http://local.test:9003')
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('a new page accepts a server, and an unknown one is refused without opening a page', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const model = connectedModel(connections)
+  const session = 'multi-new'
+  try {
+    await model.view(session)
+    // A URL spelling (`/lab`, the address the user typed) resolves to the connection's key.
+    const bound = await model.command(session, { action: 'newNotebook', server: 'http://remote.test:9002/lab' })
+    assert.equal(bound.server, 'http://remote.test:9002')
+    assert.equal(bound.serverConnected, true)
+    const pages = bound.notebooks.length
+    await assert.rejects(
+      () => model.command(session, { action: 'newNotebook', server: 'http://typo.test:9009' }),
+      /not a connected Jupyter server/,
+    )
+    const after = await model.view(session)
+    assert.equal(after.notebooks.length, pages, 'a refused server must not leave a stray page')
+    assert.equal(after.notebook, bound.notebook)
+    // A page opened without a server inherits the page it was opened from.
+    const inherited = await model.command(session, { action: 'newNotebook' })
+    assert.equal(inherited.server, 'http://remote.test:9002')
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('binding a page announces it, notes the URL and never leaks a credential', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const recorder = noteRecorder()
+  const model = connectedModel(connections, { activity: recorder.activity })
+  const session = 'multi-bind'
+  const events = []
+  try {
+    await model.view(session)
+    model.subscribe(session, (event) => events.push(event))
+    const view = await model.command(session, { action: 'bindServer', server: REMOTE.url })
+    assert.equal(view.server, 'http://remote.test:9002')
+    assert.equal(view.serverUrl, 'http://remote.test:9002')
+    assert.equal(view.serverConnected, true)
+    assert.match(view.message, /this notebook now runs on http:\/\/remote\.test:9002/)
+    const changed = events.filter((event) => event.type === 'notebook')
+    assert.equal(changed.length, 1, 'the client re-reads the whole view when the connection changes')
+    assert.equal(changed[0].notebook, 'main')
+    assert.equal(changed[0].server, 'http://remote.test:9002')
+    const note = recorder.notes.at(-1).event
+    assert.equal(note.type, 'bindServer')
+    assert.equal(note.url, 'http://remote.test:9002')
+    assert.equal(JSON.stringify({ view, events, notes: recorder.notes }).includes('remote-secret'), false)
+    // A key that is not connected is refused and leaves the binding alone.
+    await assert.rejects(
+      () => model.command(session, { action: 'bindServer', server: 'http://typo.test:9009' }),
+      /not a connected Jupyter server/,
+    )
+    assert.equal((await model.view(session)).server, 'http://remote.test:9002')
+    await assert.rejects(() => model.command(session, { action: 'bindServer' }), /binding needs a server/)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('binding while a sequence runs stops it instead of reporting into another host', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const sequence = []
+  let open = () => {}
+  let gate = Promise.resolve()
+  const model = new Notebooks({
+    directory,
+    execute: async (_sessionId, code) => {
+      sequence.push(code)
+      await gate
+      return { status: 'ok', executionCount: sequence.length, durationMs: 1, outputs: [] }
+    },
+    kernelInfo: async () => undefined,
+    servers: connections.servers,
+    connectServer: connections.connectServer,
+    forgetServer: connections.forgetServer,
+  })
+  const session = 'multi-bind-stop'
+  try {
+    const first = await model.view(session)
+    await model.command(session, { action: 'updateCell', id: first.cells[0].id, source: 'one()' })
+    await model.command(session, { action: 'addCell', source: 'two()' })
+    sequence.length = 0
+    gate = new Promise((resolve) => { open = resolve })
+    const settled = whenSettled(model, session)
+    const running = model.runAll(session)
+    await new Promise((resolve) => setImmediate(resolve))
+    const bound = await model.command(session, { action: 'bindServer', server: REMOTE.url })
+    assert.equal(bound.server, 'http://remote.test:9002')
+    open()
+    await settled
+    assert.deepEqual(sequence, ['one()'], 'the next cell must not start on the new server')
+    assert.equal(model.isRunningAll(session), false, 'the stop button is gone once the running cell settles')
+    assert.equal(await running, true)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('connectServer adds and probes a connection, and no secret reaches the panel', async () => {
+  const connections = fakeConnections([LOCAL])
+  const recorder = noteRecorder()
+  const model = connectedModel(connections, { activity: recorder.activity })
+  const session = 'multi-connect'
+  const events = []
+  try {
+    await model.view(session)
+    model.subscribe(session, (event) => events.push(event))
+    const view = await model.command(session, {
+      action: 'connectServer',
+      url: 'http://new.test:9005/lab',
+      token: 'new-secret',
+    })
+    assert.deepEqual(connections.probes.map((patch) => patch.url), ['http://new.test:9005/lab'])
+    assert.equal(connections.probes[0].token, 'new-secret', 'the host is the only one that gets the token')
+    assert.deepEqual(view.servers.map((entry) => entry.key), ['http://local.test:9003', 'http://new.test:9005'])
+    assert.equal(view.server, 'http://local.test:9003', 'adding a connection does not move the default page')
+    assert.match(view.message, /connected to http:\/\/new\.test:9005 \(token auth\); 2 kernelspec\(s\)/)
+    assert.equal(events.filter((event) => event.type === 'notebook').length, 1, 'every window re-reads the view')
+    const note = recorder.notes.at(-1).event
+    assert.equal(note.type, 'connectServer')
+    assert.equal(note.url, 'http://new.test:9005')
+    assert.equal(note.authMode, 'token')
+    assert.equal(JSON.stringify({ view, events, notes: recorder.notes }).includes('new-secret'), false)
+    // Password auth: username and kernel name travel too, and the mode is reported as such.
+    const password = await model.command(session, {
+      action: 'connectServer',
+      url: 'http://pw.test:9006',
+      password: 'pw-secret',
+      username: 'me',
+      kernelName: 'ir',
+    })
+    assert.equal(connections.probes[1].password, 'pw-secret')
+    assert.equal(connections.probes[1].username, 'me')
+    assert.equal(connections.probes[1].kernelName, 'ir')
+    assert.match(password.message, /\(password auth\)/)
+    assert.equal(JSON.stringify(password).includes('pw-secret'), false)
+    // A deployment behind an SSO/access proxy: the pasted Cookie header is the credential, and it
+    // must be handed to the host while never coming back in the view, the events or a note.
+    const proxied = await model.command(session, {
+      action: 'connectServer',
+      url: 'https://sso.test:9007/lab',
+      cookie: 'accessproxy_session=abc; _xsrf=xsrf-value',
+    })
+    assert.equal(connections.probes[2].cookie, 'accessproxy_session=abc; _xsrf=xsrf-value')
+    assert.match(proxied.message, /\(cookie auth\)/)
+    assert.ok(proxied.servers.some((entry) => entry.key === 'https://sso.test:9007' && entry.authMode === 'cookie'),
+      'the connection list must show the proxy-cookie connection')
+    const proxiedJson = JSON.stringify({ view: proxied, events, notes: recorder.notes })
+    assert.equal(proxiedJson.includes('accessproxy_session'), false, 'a proxy cookie reached the panel')
+    assert.equal(proxiedJson.includes('xsrf-value'), false, 'an XSRF value reached the panel')
+    await assert.rejects(() => model.command(session, { action: 'connectServer' }), /needs a server url/)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('a connection name reaches the view, the note and the event, and is not a credential', async () => {
+  const connections = fakeConnections([LOCAL])
+  const recorder = noteRecorder()
+  const model = connectedModel(connections, { activity: recorder.activity })
+  const session = 'named-connection'
+  try {
+    await model.view(session)
+    const view = await model.command(session, {
+      action: 'connectServer',
+      url: 'http://named.test:9008/lab',
+      password: 'named-secret',
+      name: 'GPU box',
+    })
+    assert.equal(connections.probes.at(-1).name, 'GPU box')
+    const entry = view.servers.find((server) => server.key === 'http://named.test:9008')
+    assert.equal(entry.name, 'GPU box', 'the picker needs the name in the describe list')
+    assert.equal(recorder.notes.at(-1).event.name, 'GPU box')
+    // Binding and forgetting name the same connection, so the model does not have to map a URL.
+    await model.command(session, { action: 'bindServer', server: 'http://named.test:9008' })
+    assert.equal(recorder.notes.at(-1).event.name, 'GPU box')
+    await model.command(session, { action: 'forgetServer', server: 'http://named.test:9008' })
+    assert.equal(recorder.notes.at(-1).event.name, 'GPU box')
+    // A name is a label; the password still never leaves the host.
+    assert.equal(JSON.stringify({ view, notes: recorder.notes }).includes('named-secret'), false)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('a connection that fails its probe is reported and changes nothing', async () => {
+  const connections = fakeConnections([LOCAL])
+  const recorder = noteRecorder()
+  const model = connectedModel(connections, { activity: recorder.activity })
+  const session = 'multi-connect-fail'
+  const events = []
+  try {
+    await model.view(session)
+    model.subscribe(session, (event) => events.push(event))
+    connections.state.failProbe = true
+    await assert.rejects(
+      () => model.command(session, { action: 'connectServer', url: 'http://typo.test:9009', token: 'nope' }),
+      /authentication failed/,
+    )
+    assert.deepEqual((await model.view(session)).servers.map((entry) => entry.key), ['http://local.test:9003'])
+    assert.equal(events.length, 0, 'a failed add is not a notebook change')
+    assert.equal(recorder.notes.length, 0, 'a failed add is not something the user did to the notebook')
+    assert.equal(JSON.stringify(recorder.notes).includes('nope'), false)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('forgetting a connection leaves its page visible, marked not connected, and a run fails readably', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const recorder = noteRecorder()
+  const model = new Notebooks({
+    directory,
+    // A stand-in for the runtime: executing on a connection that is gone fails the way the host does.
+    execute: async (_sessionId, code, options) => {
+      const known = connections.servers().servers.some((entry) => entry.key === options?.server)
+      if (options?.server !== undefined && !known) {
+        throw new Error(`jupyter server ${options.server} is not configured; add it in the panel or with jupyter_connect`)
+      }
+      return { status: 'ok', executionCount: 1, durationMs: 1, outputs: [{ kind: 'stream', name: 'stdout', text: `${code}\n` }] }
+    },
+    kernelInfo: async () => undefined,
+    servers: connections.servers,
+    connectServer: connections.connectServer,
+    forgetServer: connections.forgetServer,
+    activity: recorder.activity,
+  })
+  const session = 'multi-forget'
+  const events = []
+  try {
+    await model.view(session)
+    await model.command(session, { action: 'bindServer', server: REMOTE.url })
+    model.subscribe(session, (event) => events.push(event))
+    const view = await model.command(session, { action: 'forgetServer', server: REMOTE.url })
+    assert.equal(view.server, 'http://remote.test:9002', 'the page keeps the key it was bound to')
+    assert.equal(view.serverUrl, 'http://remote.test:9002')
+    assert.equal(view.serverConnected, false, 'the page still renders, marked not connected')
+    assert.deepEqual(view.servers.map((entry) => entry.key), ['http://local.test:9003'])
+    assert.equal(view.defaultServer, 'http://local.test:9003', 'the default moves to a connection that exists')
+    assert.match(view.message, /disconnected from http:\/\/remote\.test:9002/)
+    assert.ok(view.cells.length >= 1)
+    assert.equal(events.filter((event) => event.type === 'notebook').length, 1)
+    const note = recorder.notes.at(-1).event
+    assert.equal(note.type, 'forgetServer')
+    assert.equal(note.url, 'http://remote.test:9002')
+    assert.equal(JSON.stringify({ view, events, notes: recorder.notes }).includes('remote-secret'), false)
+    // A run on the forgotten server is a readable error on the cell, never a silent fallback.
+    await model.command(session, { action: 'runCell', id: view.cells[0].id, source: 'print(1)' })
+    await model.idle(session)
+    const ran = (await model.view(session)).cells[0]
+    assert.equal(ran.status, 'error')
+    assert.match(ran.error, /is not configured/)
+    // The model-facing summaries keep naming the host the page belongs to.
+    assert.equal(model.snapshot(session).server, 'http://remote.test:9002')
+    assert.match(model.outline(session), /bound to http:\/\/remote\.test:9002 \(not connected\)/)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('snapshot and outline name the server the page runs on', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const model = connectedModel(connections)
+  const session = 'multi-naming'
+  try {
+    const first = await model.view(session)
+    await model.command(session, { action: 'bindServer', server: REMOTE.url })
+    await model.command(session, { action: 'updateCell', id: first.cells[0].id, source: 'import pandas as pd' })
+    const snapshot = model.snapshot(session)
+    assert.equal(snapshot.server, 'http://remote.test:9002')
+    assert.equal(snapshot.notebook, 'main')
+    const outline = model.outline(session)
+    assert.match(outline, /running on http:\/\/remote\.test:9002/)
+    assert.match(outline, /import pandas as pd/)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('activeServer names the page connection without opening a desk', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const model = connectedModel(connections)
+  const session = 'multi-active'
+  try {
+    assert.equal(model.activeServer('never-opened'), undefined)
+    assert.equal(model.size, 0, 'a peek must not create a session')
+    await model.view(session)
+    assert.deepEqual(model.activeServer(session), {
+      key: 'http://local.test:9003',
+      url: 'http://local.test:9003',
+      connected: true,
+    })
+    await model.command(session, { action: 'bindServer', server: REMOTE.url })
+    assert.equal(model.activeServer(session).key, 'http://remote.test:9002')
+    await model.command(session, { action: 'forgetServer', server: REMOTE.url })
+    assert.deepEqual(model.activeServer(session), {
+      key: 'http://remote.test:9002',
+      url: 'http://remote.test:9002',
+      connected: false,
+    })
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('switching or opening a page reports the server when it changes', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const recorder = noteRecorder()
+  const model = connectedModel(connections, { activity: recorder.activity })
+  const session = 'multi-page-notes'
+  try {
+    await model.view(session)
+    await model.command(session, { action: 'bindServer', server: REMOTE.url })
+    await model.command(session, { action: 'newNotebook' })
+    let note = recorder.notes.at(-1).event
+    assert.equal(note.type, 'newNotebook')
+    assert.equal(note.server, 'http://remote.test:9002', 'a new page inherits the bound server')
+    assert.equal(note.previousServer, 'http://remote.test:9002')
+    await model.command(session, { action: 'bindServer', server: LOCAL.url })
+    await model.command(session, { action: 'switchNotebook', notebook: 'main' })
+    note = recorder.notes.at(-1).event
+    assert.equal(note.type, 'switchNotebook')
+    assert.equal(note.server, 'http://remote.test:9002', 'the note carries the target page\'s server URL')
+    assert.equal(note.previousServer, 'http://local.test:9003', 'and the page it came from, so the change is visible')
+    assert.equal(JSON.stringify(recorder.notes).includes('remote-secret'), false)
+  } finally {
+    model.dispose()
+  }
+})
+
+await check('a page binding survives the mirror, and a mirror without one follows the default', async () => {
+  const connections = fakeConnections([LOCAL, REMOTE])
+  const session = 'multi-mirror'
+  const model = connectedModel(connections)
+  try {
+    const view = await model.view(session)
+    await model.command(session, { action: 'updateCell', id: view.cells[0].id, source: 'kept = 1' })
+    let raw = JSON.parse(readFileSync(path.join(directory, `${session}.json`), 'utf8'))
+    assert.equal(raw.notebooks.main.server, null, 'a page that follows the default stores null')
+    await model.command(session, { action: 'bindServer', server: REMOTE.url })
+  } finally {
+    model.dispose()
+  }
+  const raw = JSON.parse(readFileSync(path.join(directory, `${session}.json`), 'utf8'))
+  assert.equal(raw.notebooks.main.server, 'http://remote.test:9002')
+  const reopened = connectedModel(connections)
+  try {
+    const view = await reopened.view(session)
+    assert.equal(view.server, 'http://remote.test:9002', 'the binding must not be lost on reload')
+    assert.equal(view.serverConnected, true)
+  } finally {
+    reopened.dispose()
+  }
+  // A mirror written before servers were bindable has no `server`: the page follows the default.
+  const legacy = 'multi-legacy-binding'
+  writeFileSync(path.join(directory, `${legacy}.json`), JSON.stringify({
+    cells: [{ id: 'legacy-1', kind: 'code', source: 'legacy = True', origin: 'user', outputs: [], status: 'idle', executionCount: null, durationMs: null, error: null, rev: 1 }],
+    path: null,
+    revision: 3,
+  }))
+  const fromLegacy = connectedModel(connections)
+  try {
+    const view = await fromLegacy.view(legacy)
+    assert.equal(view.server, 'http://local.test:9003', 'a mirror with no binding follows the default')
+    assert.equal(view.serverUrl, 'http://local.test:9003')
+    assert.equal(view.cells[0].source, 'legacy = True')
+  } finally {
+    fromLegacy.dispose()
+  }
+})
+
 console.log('\nhttp route')
 
 const registered = []
@@ -1111,6 +1682,45 @@ await check('POST with a bad command reports the error without a 500', async () 
 await check('POST with a malformed body reports it', async () => {
   const response = await route.fetch(new Request(`http://127.0.0.1:19387${NOTEBOOK_ROUTE}`, { method: 'POST', body: 'not json' }))
   assert.equal(response.status, 400)
+})
+
+await check('the route carries connection commands and never echoes a secret', async () => {
+  const connections = fakeConnections([LOCAL])
+  const routed = connectedModel(connections)
+  const registeredHere = []
+  registerNotebookRoutes(
+    { inject: (_deps, callback) => { callback(childContext({ fetch: { register: (entry) => { registeredHere.push(entry); return () => {} } } })) } },
+    { notebooks: routed, connectionInfo: () => ({ configured: true }), onState: () => {} },
+  )
+  const routeHere = registeredHere.find((entry) => entry.path === NOTEBOOK_ROUTE)
+  const postHere = async (body) => (await routeHere.fetch(new Request(`http://127.0.0.1:19387${NOTEBOOK_ROUTE}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }))).json()
+  try {
+    const view = await postHere({
+      sessionId: 'route-multi',
+      action: 'connectServer',
+      url: 'http://route.test:9007',
+      token: 'route-secret',
+    })
+    assert.deepEqual(view.servers.map((entry) => entry.key), ['http://local.test:9003', 'http://route.test:9007'])
+    assert.match(view.message, /connected to http:\/\/route\.test:9007/)
+    assert.equal(JSON.stringify(view).includes('route-secret'), false)
+    const bound = await postHere({ sessionId: 'route-multi', action: 'bindServer', server: 'http://route.test:9007' })
+    assert.equal(bound.server, 'http://route.test:9007')
+    const fetched = await (await routeHere.fetch(new Request(
+      `http://127.0.0.1:19387${NOTEBOOK_ROUTE}?sessionId=route-multi`,
+      { method: 'GET' },
+    ))).json()
+    assert.equal(fetched.server, 'http://route.test:9007')
+    assert.equal(fetched.serverConnected, true)
+    assert.equal(fetched.defaultServer, 'http://local.test:9003')
+    assert.equal(JSON.stringify(fetched).includes('route-secret'), false)
+  } finally {
+    routed.dispose()
+  }
 })
 
 await check('the asset route serves the bytes with an immutable cache header', async () => {
