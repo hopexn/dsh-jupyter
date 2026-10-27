@@ -330,6 +330,11 @@ jupyter_execute
   原位，而 4xx/5xx 会被 `callHost` 当成传输故障处理。
 - **命令不带 `request.signal`。** 带着它，用户刷新页面就等于取消命令；`runCell` 更糟——中断会
   一路传到 `POST /interrupt`，把正在跑的单元格杀掉。`runCell` 不再等待执行之后，这条尤其重要。
+- **每条路由都要声明 `requestBody: 'buffered'`。** `/api` 的 HTTP carrier 对没声明的路由默认
+  streaming，会给请求装一个 body stream；而 GET/HEAD 带 body 的 `new Request` 会抛错，carrier 直接
+  回 **400**，handler 根本不会跑。命令路由一直声明了它，所以能工作；asset / stream / download
+  三条 GET 路由漏了，于是图片显示 400、SSE 实时流 400（面板靠轮询才更新）、导出 400。
+  这类缺陷单元测试用假 Connection 看不出来，所以测试里对**每条**注册路由断言 body mode。
 - **视图带连接信息。** `view()` 带上 `server`（当前页解析后的键）、`serverUrl`、`serverConnected`、
   `defaultServer`、`configured` 和 `servers`（describe 列表：key/url/label/authMode/hasCredentials/
   default，**没有凭据**）。路由把 `connectionInfo()` 合并进每一个答复，包括 `?since=` 命中的短答

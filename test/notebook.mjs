@@ -1630,6 +1630,14 @@ await check('the registered route carries the panel protocol', () => {
   assert.deepEqual([...streamRoute.methods], ['GET'])
   assert.deepEqual([...assetRoute.methods], ['GET'])
   assert.deepEqual([...downloadRoute.methods], ['GET'])
+  // The `/api` carrier streams the body of a route that declares no `requestBody`, and a GET
+  // Request with a body throws inside the carrier — the browser gets 400 before the handler runs.
+  // That is what broke images and the output stream while commands kept working, so every route
+  // must declare a body mode the carrier accepts.
+  for (const entry of registered) {
+    assert.ok(entry.requestBody === 'buffered' || entry.requestBody === 'streaming',
+      `${entry.path} declares no requestBody: the carrier's streaming default answers GET with 400`)
+  }
   assert.deepEqual(states, ['registered'])
 })
 
